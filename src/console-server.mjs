@@ -561,6 +561,22 @@ async function handleApi(req, res, requestUrl) {
       else toCreate.push(account);
     }
 
+    // 首次导入的账户：在名字上追加初始余额后缀（oauth---email---N，N 为整数美元）。
+    // 余额还没查过则实时查一次；查询失败或已带后缀则保持原名。只对首次导入生效，
+    // 后续重新授权走 PUT 覆盖（toUpdate），名字保持首次上传时的标记不再变动。
+    if (toCreate.length) {
+      const jobByEmail = new Map();
+      for (const job of downloadable) {
+        const email = String(job.email || "").trim().toLowerCase();
+        if (email && isEmail(email)) jobByEmail.set(email, job);
+      }
+      await Promise.all(toCreate.map(async (account) => {
+        const email = sub2ApiAccountEmail(account);
+        const job = email ? jobByEmail.get(email) : null;
+        if (job) await appendInitialBalanceSuffix(account, job);
+      }));
+    }
+
     // 新增组：保持原有 batch 创建逻辑（含 Idempotency-Key），仅在非空时发送。
     let createResult = null;
     if (toCreate.length) {
@@ -2759,6 +2775,43 @@ function sub2ApiAccountEmail(account) {
   if (direct) return direct;
   const match = String(account?.name || "").toLowerCase().match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
   return match && isEmail(match[0]) ? match[0] : null;
+}
+
+/**
+ * Credit 余额 → 整数美元后缀字符串。
+ * credits balance / 25 得到美元，四舍五入取整，形如 "---4"。
+ * balance 不是有效数字时返回空串（表示不加后缀）。
+ */
+function formatCreditBalanceSuffix(balance) {
+  if (balance === null || balance === undefined) return "";
+  const usd = Math.round(Number(balance) / 25);
+  return Number.isFinite(usd) ? `---${usd}` : "";
+}
+
+/**
+ * 判断 account.name 是否已带余额后缀（以 ---数字 结尾），避免重复追加。
+ */
+function hasBalanceSuffixInName(name) {
+  return /---\d+$/.test(String(name || ""));
+}
+
+/**
+ * 为首次导入的 account 追加初始余额后缀。
+ * 只有名字尚未带后缀时才处理：若余额还没查过则实时查一次，再按整数美元追加。
+ * 任何异常（余额查询失败等）都不阻断主流程，此时保持原名不加后缀。
+ */
+async function appendInitialBalanceSuffix(account, job) {
+  if (!account || hasBalanceSuffixInName(account.name)) return;
+  if (!job) return;
+  try {
+    if (job.creditBalance === null && !job.creditError) {
+      await refreshJobCreditBalance(job);
+    }
+    const suffix = formatCreditBalanceSuffix(job.creditBalance);
+    if (suffix) account.name = `${account.name}${suffix}`;
+  } catch {
+    // 余额查询失败时保持原名，不阻断上传
+  }
 }
 
 function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
