@@ -333,6 +333,21 @@ tbody tr:last-child td { border-bottom: 0; }
 .status-badge.canceled { color: #69716f; background: #eff1f0; }
 .status-badge.reauth_required { color: var(--danger); background: var(--danger-soft); }
 .status-badge.resume_available { color: var(--amber); background: var(--amber-soft); }
+.banned-badge {
+  margin-top: 5px;
+  min-height: 25px;
+  width: fit-content;
+  padding: 4px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 5px;
+  color: #fff;
+  background: var(--danger);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
 .status-badge.refreshing { color: var(--blue); background: var(--blue-soft); }
 .status-badge.totp_starting { color: var(--blue); background: var(--blue-soft); }
 
@@ -441,6 +456,13 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .text-action:hover { color: var(--green); }
 .time-cell { color: #727d79; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.credit-cell { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.credit-value { display: inline-flex; flex-direction: column; line-height: 1.25; }
+.credit-value strong { font-size: 13px; color: var(--ink); }
+.credit-value small { font-size: 11px; color: #8a9490; }
+.credit-value.credit-positive strong { color: var(--teal); }
+.credit-pending { color: #aab2ae; }
+.credit-error { color: var(--danger); font-size: 12px; cursor: help; }
 .row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; white-space: nowrap; }
 .row-actions > button { flex: 0 0 auto; white-space: nowrap; }
 .download-button { height: 32px; padding: 0 11px; font-size: 12px; }

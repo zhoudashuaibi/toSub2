@@ -19,13 +19,17 @@ try {
   };
   const store = createCredentialStore({ platform: "win32", windowsRoot: tempRoot, powerShellRunner });
   const email = "Windows.User@example.com";
+  const emptyCreds = { password: "", totpSecret: "", proxyUrl: "", outlookClientId: "", outlookRefreshToken: "", outlookPassword: "" };
   const credentials = {
     password: "test-password",
     totpSecret: "JBSWY3DPEHPK3PXP",
     proxyUrl: "socks5h://user:secret@proxy.example:5000",
+    outlookClientId: "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+    outlookRefreshToken: "M.C509_BL2.0.U.-".repeat(30),
+    outlookPassword: "outlook-pw-12345",
   };
 
-  assert.deepEqual(await store.load(email), { password: "", totpSecret: "", proxyUrl: "" });
+  assert.deepEqual(await store.load(email), emptyCreds);
   await store.save(email, credentials);
   assert.deepEqual(await store.load(email.toLowerCase()), credentials);
 
@@ -33,25 +37,32 @@ try {
     password: "更新后的密码",
     totpSecret: "NB2W45DFOIZAQWER",
     proxyUrl: "http://updated:secret@proxy.example:8080",
+    outlookClientId: "",
+    outlookRefreshToken: "",
+    outlookPassword: "",
   };
   await store.save(email, updatedCredentials);
-  assert.deepEqual(await store.load(email), updatedCredentials);
+  assert.deepEqual(await store.load(email), { ...emptyCreds, ...updatedCredentials });
 
+  // Outlook 凭据单独往返 + 密文落盘校验
+  await store.save(email, credentials);
   const storedFiles = await fs.readdir(tempRoot);
   assert.equal(storedFiles.length, 1);
   const encryptedAtRest = await fs.readFile(path.join(tempRoot, storedFiles[0]), "utf8");
-  assert.equal(encryptedAtRest.includes(updatedCredentials.password), false);
-  assert.equal(encryptedAtRest.includes(updatedCredentials.proxyUrl), false);
+  assert.equal(encryptedAtRest.includes(credentials.password), false);
+  assert.equal(encryptedAtRest.includes(credentials.proxyUrl), false);
+  assert.equal(encryptedAtRest.includes(credentials.outlookRefreshToken), false);
+  assert.equal(encryptedAtRest.includes(credentials.outlookPassword), false);
 
   await store.delete(email);
-  assert.deepEqual(await store.load(email), { password: "", totpSecret: "", proxyUrl: "" });
+  assert.deepEqual(await store.load(email), emptyCreds);
 
   if (process.platform === "win32") {
     const realStore = createCredentialStore({ windowsRoot: path.join(tempRoot, "real-dpapi") });
     await realStore.save(email, credentials);
     assert.deepEqual(await realStore.load(email), credentials);
     await realStore.delete(email);
-    assert.deepEqual(await realStore.load(email), { password: "", totpSecret: "", proxyUrl: "" });
+    assert.deepEqual(await realStore.load(email), emptyCreds);
   }
 
   let macKey = "";
@@ -93,10 +104,14 @@ try {
         : { code: 0, stdout: "", stderr: "" }
     ),
   });
+  // version-2 旧 payload 不含 outlook 字段，应回退为空串而不是 undefined
   assert.deepEqual(await legacyMacStore.load(email), {
     password: credentials.password,
     totpSecret: credentials.totpSecret,
     proxyUrl: "",
+    outlookClientId: "",
+    outlookRefreshToken: "",
+    outlookPassword: "",
   });
 
   const unsupportedStore = createCredentialStore({ platform: "linux" });

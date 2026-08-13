@@ -38,6 +38,8 @@ const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
 const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
+const OUTLOOK_FETCH_SETTINGS_KEY = "chatgpt-onboarding.outlook-fetch-settings-v1";
+const DEFAULT_OUTLOOK_ENDPOINT = "https://8t92.cc/api/fetch-mails";
 const REGION_NAMES = typeof Intl.DisplayNames === "function"
   ? new Intl.DisplayNames(["zh-CN"], { type: "region" })
   : null;
@@ -52,6 +54,15 @@ function App() {
   const [batchText, setBatchText] = useState("");
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchError, setBatchError] = useState("");
+  const [outlookOpen, setOutlookOpen] = useState(false);
+  const [outlookText, setOutlookText] = useState("");
+  const [outlookBusy, setOutlookBusy] = useState(false);
+  const [outlookError, setOutlookError] = useState("");
+  const [outlookFetchOpen, setOutlookFetchOpen] = useState(false);
+  const [outlookFetchBusy, setOutlookFetchBusy] = useState(false);
+  const [outlookFetchError, setOutlookFetchError] = useState("");
+  const [outlookSettings, setOutlookSettings] = useState(() => readLocalJson(OUTLOOK_FETCH_SETTINGS_KEY, { endpoint: "" }));
+  const [outlookSettingsDraft, setOutlookSettingsDraft] = useState(() => readLocalJson(OUTLOOK_FETCH_SETTINGS_KEY, { endpoint: "" }));
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterText, setFilterText] = useState("");
   const [filterError, setFilterError] = useState("");
@@ -95,6 +106,7 @@ function App() {
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
   useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
+  useEffect(() => writeLocalJson(OUTLOOK_FETCH_SETTINGS_KEY, outlookSettings), [outlookSettings]);
 
   useEffect(() => {
     let stopped = false;
@@ -300,9 +312,19 @@ function App() {
         body: JSON.stringify({ ids, config: sub2apiSettings }),
       });
       const result = data.result || {};
-      const created = result.account_created ?? result.success ?? data.uploaded;
-      const failed = result.account_failed ?? result.failed ?? 0;
-      setUploadNotice(`已上传 ${created} 条${failed ? `，失败 ${failed} 条` : ""}${data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : ""}`);
+      const skippedText = data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : "";
+      // 新版后端按 email 查重，区分「新增」与「覆盖已存在」；旧版后端回退到原字段。
+      if (typeof data.created === "number" || typeof data.updated === "number") {
+        const parts = [];
+        if (data.created) parts.push(`新增 ${data.created} 条`);
+        if (data.updated) parts.push(`覆盖 ${data.updated} 条`);
+        if (data.updateFailed?.length) parts.push(`覆盖失败 ${data.updateFailed.length} 条`);
+        setUploadNotice(parts.length ? `${parts.join("，")}${skippedText}` : `未变更${skippedText}`);
+      } else {
+        const created = result.account_created ?? result.success ?? data.uploaded;
+        const failed = result.account_failed ?? result.failed ?? 0;
+        setUploadNotice(`已上传 ${created} 条${failed ? `，失败 ${failed} 条` : ""}${skippedText}`);
+      }
       setSelectedJobIds(new Set());
       setError("");
     } catch (requestError) {
@@ -436,6 +458,62 @@ function App() {
       setBatchError(requestError.message);
     } finally {
       setBatchBusy(false);
+    }
+  }
+
+  async function createOutlookBatch(event) {
+    event.preventDefault();
+    if (!outlookText.trim() || outlookBusy) return;
+    setOutlookBusy(true);
+    try {
+      const data = await apiFetch(token, "/api/jobs/outlook-batch", {
+        method: "POST",
+        body: JSON.stringify({ text: outlookText, proxyUrl: accountProxyUrl.trim() }),
+      });
+      setPage(1);
+      if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 20));
+      setOutlookText("");
+      setOutlookError("");
+      setOutlookOpen(false);
+      setError("");
+    } catch (requestError) {
+      setOutlookError(requestError.message);
+    } finally {
+      setOutlookBusy(false);
+    }
+  }
+
+  function openOutlookFetchSettings() {
+    setOutlookSettingsDraft({ ...outlookSettings });
+    setOutlookFetchError("");
+    setOutlookFetchOpen(true);
+    fetch("/api/outlook-fetch-config")
+      .then(readResponse)
+      .then((data) => {
+        if (data?.endpoint) {
+          setOutlookSettings({ endpoint: data.endpoint });
+          setOutlookSettingsDraft({ endpoint: data.endpoint });
+        }
+      })
+      .catch(() => {});
+  }
+
+  async function saveOutlookFetchSettings(event) {
+    event.preventDefault();
+    if (outlookFetchBusy) return;
+    setOutlookFetchBusy(true);
+    try {
+      const data = await apiFetch(token, "/api/outlook-fetch-config", {
+        method: "POST",
+        body: JSON.stringify({ endpoint: outlookSettingsDraft.endpoint || DEFAULT_OUTLOOK_ENDPOINT }),
+      });
+      setOutlookSettings({ endpoint: data.endpoint });
+      setOutlookFetchError("");
+      setOutlookFetchOpen(false);
+    } catch (requestError) {
+      setOutlookFetchError(requestError.message);
+    } finally {
+      setOutlookFetchBusy(false);
     }
   }
 
@@ -599,6 +677,24 @@ function App() {
     }
   }
 
+  async function refreshCreditsSelected() {
+    if (!selectedJobIds.size || batchAction) return;
+    setBatchAction("refresh-credits");
+    try {
+      const data = await apiFetch(token, "/api/jobs/refresh-credits", {
+        method: "POST",
+        body: JSON.stringify({ ids: [...selectedJobIds] }),
+      });
+      setJobs((current) => mergeJobs(data.jobs, current));
+      setError("");
+      setUploadNotice(`已查询 ${data.checked} 个账号的余额`);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
   async function cancelAllRunningJobs() {
     const runningCount = (stats.active || 0) + (stats.queued || 0);
     if (!runningCount || batchAction) return;
@@ -661,6 +757,10 @@ function App() {
               <ListPlus size={17} />
               批量添加
             </button>
+            <button className="secondary-button" type="button" onClick={() => { setOutlookError(""); setOutlookOpen(true); }} disabled={!token} title="导入 Outlook 邮箱（refresh_token 自动收码）">
+              <Mail size={17} />
+              Outlook 导入
+            </button>
             <button
               className={`secondary-button ${emailFilter.length ? "filter-active" : ""}`}
               type="button"
@@ -698,7 +798,7 @@ function App() {
           <span className={`provider-ready ${sub2apiSettings.adminApiKey ? "" : "incomplete"}`}>
             {sub2apiSettings.adminApiKey ? <Check size={14} /> : <CircleAlert size={14} />}
             {sub2apiSettings.adminApiKey
-              ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""}`
+              ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : sub2apiSettings.autoSelectProxy ? " · 自动选代理" : ""}`
               : "未完成配置"}
           </span>
           {features.sub2apiMonitor && (
@@ -749,6 +849,18 @@ function App() {
           </span>
         </div>
 
+        <div className="provider-toolbar outlook-fetch-toolbar" aria-label="Outlook 邮箱取件配置">
+          <div className="provider-heading"><Mail size={17} /><strong>Outlook 取件</strong></div>
+          <span className="provider-name">{outlookSettings.endpoint || "默认接口"}</span>
+          <span className={`provider-ready ${outlookSettings.endpoint ? "" : "incomplete"}`}>
+            <MailCheck size={14} />
+            {outlookSettings.endpoint ? "已配置取件接口" : "使用默认接口"}
+          </span>
+          <button type="button" className="secondary-button provider-settings-button" onClick={openOutlookFetchSettings} title="配置 Outlook 取件接口地址">
+            <Settings2 size={16} />配置
+          </button>
+        </div>
+
         {error && (
           <div className="global-error" role="alert">
             <CircleAlert size={17} />
@@ -770,6 +882,9 @@ function App() {
               <span>当前页 {jobs.length} 条，跨页已选 {selectedJobIds.size} 条，可下载 {downloadableSelectedCount} 条</span>
               <button type="button" className="selection-text-button" onClick={toggleAllOnPage} disabled={allPageSelected || !pageJobIds.length}>
                 本页全选
+              </button>
+              <button type="button" className="selection-text-button" onClick={() => setSelectedJobIds(new Set(jobs.filter((job) => Number(job.creditBalance) > 0).map((job) => job.id)))} disabled={!jobs.some((job) => Number(job.creditBalance) > 0)}>
+                选中余额账号
               </button>
               <button type="button" className="selection-text-button" onClick={() => setSelectedJobIds(new Set())} disabled={!selectedJobIds.size}>
                 清除选择
@@ -803,6 +918,10 @@ function App() {
                   导出原始信息
                 </button>
               )}
+              <button type="button" className="secondary-button bulk-button" onClick={refreshCreditsSelected} disabled={!selectedJobIds.size || Boolean(batchAction)}>
+                {batchAction === "refresh-credits" ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
+                查询余额
+              </button>
               <button type="button" className="regenerate-button bulk-button" onClick={reauthorizeSelected} disabled={!canReauthorizeSelected || Boolean(batchAction)}>
                 {batchAction === "reauthorize" ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
                 批量重新授权
@@ -843,6 +962,7 @@ function App() {
                 <th>账号</th>
                 <th>状态</th>
                 <th>当前操作</th>
+                <th>余额</th>
                 <th>开始时间</th>
                 <th className="actions-heading">操作</th>
               </tr>
@@ -870,7 +990,7 @@ function App() {
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
-                      <td colSpan="6"><JobLogs token={token} jobId={job.id} /></td>
+                      <td colSpan="7"><JobLogs token={token} jobId={job.id} /></td>
                     </tr>
                   )}
                 </React.Fragment>
@@ -1102,6 +1222,40 @@ function App() {
                   {sub2apiProxies.map((proxy) => <option key={proxy.id} value={String(proxy.id)}>{formatSub2ApiProxy(proxy)}</option>)}
                 </select>
               </label>
+              <label className="settings-field wide-settings-field sub2api-monitor-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(sub2apiSettingsDraft.autoSelectProxy)}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, autoSelectProxy: event.target.checked }))}
+                  disabled={Boolean(sub2apiSettingsDraft.proxyId)}
+                />
+                <span>
+                  <strong>新号自动选择绑定最少的代理</strong>
+                  <small>未指定代理时，为每个新号独立选择当前绑定账号最少的可用代理，并列时随机。手动指定代理后此项失效。</small>
+                </span>
+              </label>
+              <label className="settings-field wide-settings-field sub2api-monitor-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(sub2apiSettingsDraft.disableAutoPause5h)}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, disableAutoPause5h: event.target.checked }))}
+                />
+                <span>
+                  <strong>禁用 5h 自动暂停</strong>
+                  <small>上传的账号在 5 小时滚动窗口用量超阈时不会被自动暂停（设置 auto_pause_5h_disabled）。</small>
+                </span>
+              </label>
+              <label className="settings-field wide-settings-field sub2api-monitor-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(sub2apiSettingsDraft.disableAutoPause7d)}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, disableAutoPause7d: event.target.checked }))}
+                />
+                <span>
+                  <strong>禁用 7d 自动暂停</strong>
+                  <small>上传的账号在 7 天滚动窗口用量超阈时不会被自动暂停（设置 auto_pause_7d_disabled）。</small>
+                </span>
+              </label>
               <label className="settings-field">
                 <span>并发数</span>
                 <input
@@ -1209,6 +1363,75 @@ function App() {
               <button type="submit" className="primary-button" disabled={!batchText.trim() || batchBusy || countBatchLines(batchText) > 500}>
                 {batchBusy ? <LoaderCircle className="spin" size={17} /> : <ListPlus size={17} />}
                 创建 {countBatchLines(batchText) || ""} 条任务
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+      {outlookOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !outlookBusy) setOutlookOpen(false);
+        }}>
+          <form className="batch-dialog" onSubmit={createOutlookBatch} role="dialog" aria-modal="true" aria-labelledby="outlook-title">
+            <div className="dialog-header">
+              <div>
+                <h2 id="outlook-title">导入 Outlook 邮箱</h2>
+                <span>{countBatchLines(outlookText)} 条，使用刷新令牌自动收取 ChatGPT 验证码</span>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setOutlookOpen(false)} disabled={outlookBusy} title="关闭">
+                <X size={18} />
+              </button>
+            </div>
+            <label className="batch-label" htmlFor="outlook-input">每行一条：邮箱----密码----clientId----refresh_token。密码和 refresh_token 会加密保存，不写入日志或元数据。</label>
+            <textarea
+              id="outlook-input"
+              value={outlookText}
+              onChange={(event) => setOutlookText(event.target.value)}
+              placeholder={"name@outlook.com----邮箱密码----9e5f94bc-e8a4-4e73-b8be-63364c29d753----M.C509_BL2.0.U...."}
+              spellCheck="false"
+              autoFocus
+            />
+            {outlookError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{outlookError}</div>}
+            <div className="dialog-footer">
+              <button type="button" className="cancel-button" onClick={() => setOutlookOpen(false)} disabled={outlookBusy}>取消</button>
+              <button type="submit" className="primary-button" disabled={!outlookText.trim() || outlookBusy || countBatchLines(outlookText) > 500}>
+                {outlookBusy ? <LoaderCircle className="spin" size={17} /> : <Mail size={17} />}
+                创建 {countBatchLines(outlookText) || ""} 条任务
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+      {outlookFetchOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !outlookFetchBusy) setOutlookFetchOpen(false);
+        }}>
+          <form className="batch-dialog" onSubmit={saveOutlookFetchSettings} role="dialog" aria-modal="true" aria-labelledby="outlook-fetch-title">
+            <div className="dialog-header">
+              <div>
+                <h2 id="outlook-fetch-title">Outlook 取件接口</h2>
+                <span>读取 Outlook 收件箱使用的接口地址，配置保存在本机</span>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setOutlookFetchOpen(false)} disabled={outlookFetchBusy} title="关闭">
+                <X size={18} />
+              </button>
+            </div>
+            <label className="batch-label" htmlFor="outlook-endpoint-input">接口地址（留空使用默认 {DEFAULT_OUTLOOK_ENDPOINT}）</label>
+            <input
+              id="outlook-endpoint-input"
+              type="text"
+              value={outlookSettingsDraft.endpoint}
+              onChange={(event) => setOutlookSettingsDraft({ endpoint: event.target.value })}
+              placeholder={DEFAULT_OUTLOOK_ENDPOINT}
+              spellCheck="false"
+              autoFocus
+            />
+            {outlookFetchError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{outlookFetchError}</div>}
+            <div className="dialog-footer">
+              <button type="button" className="cancel-button" onClick={() => setOutlookFetchOpen(false)} disabled={outlookFetchBusy}>取消</button>
+              <button type="submit" className="primary-button" disabled={outlookFetchBusy}>
+                {outlookFetchBusy ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}
+                保存
               </button>
             </div>
           </form>
@@ -1416,12 +1639,15 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <LoginMethodBadge job={job} />
         </div>
       </td>
-      <td><StatusBadge status={job.status} /></td>
+      <td>
+        <StatusBadge status={job.status} />
+        {job.autoRepairBlocked && <span className="banned-badge"><Ban size={13} />已封禁</span>}
+      </td>
       <td className="step-cell">
         <div className="prompt-line">{job.prompt}</div>
         {job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}
         {job.autoRepairBlocked && (
-          <div className="row-error">号池监控已永久跳过：{extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}</div>
+          <div className="row-error">账号已封禁：{extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}</div>
         )}
         {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
         {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
@@ -1501,6 +1727,18 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               </>
             )}
           </div>
+        )}
+      </td>
+      <td className="credit-cell">
+        {job.creditBalance === null && !job.creditError && <span className="credit-pending">—</span>}
+        {job.creditBalance !== null && (
+          <span className={job.creditBalance > 0 ? "credit-value credit-positive" : "credit-value"}>
+            <strong>{formatCredit(job.creditBalance)}</strong>
+            {job.creditBalance > 0 && <small>≈ ${(job.creditBalance / 25).toFixed(2)}</small>}
+          </span>
+        )}
+        {job.creditError && job.creditBalance === null && (
+          <span className="credit-error" title={job.creditError}>查询失败</span>
         )}
       </td>
       <td className="time-cell">{formatTime(job.createdAt)}</td>
@@ -1756,6 +1994,12 @@ function formatTime(value) {
   }).format(new Date(value));
 }
 
+function formatCredit(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "—";
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(num);
+}
+
 function countBatchLines(value) {
   return String(value || "").split(/\r?\n/).filter((line) => line.trim()).length;
 }
@@ -1802,6 +2046,14 @@ function readLocalSetting(key) {
   } catch {
     return "";
   }
+}
+
+function readLocalJson(key, fallback) {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(key) || "null");
+    if (stored && typeof stored === "object") return stored;
+  } catch {}
+  return typeof fallback === "object" && fallback !== null ? fallback : {};
 }
 
 function readLocalTextSetting(key) {
@@ -1854,6 +2106,9 @@ function normalizeSub2ApiSettings(value) {
     priority: String(stored.priority ?? ""),
     modelWhitelist: String(stored.modelWhitelist || ""),
     monitorEnabled: stored.monitorEnabled === true,
+    autoSelectProxy: stored.autoSelectProxy !== false,
+    disableAutoPause5h: stored.disableAutoPause5h === true,
+    disableAutoPause7d: stored.disableAutoPause7d === true,
   };
 }
 

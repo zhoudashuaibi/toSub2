@@ -50,10 +50,14 @@ export function createCredentialStore(options = {}) {
   return {
     async save(email, credentials) {
       const payload = JSON.stringify({
-        version: 2,
+        version: 3,
         password: typeof credentials.password === "string" ? credentials.password : "",
         totpSecret: typeof credentials.totpSecret === "string" ? credentials.totpSecret : "",
         proxyUrl: typeof credentials.proxyUrl === "string" ? credentials.proxyUrl : "",
+        outlookClientId: typeof credentials.outlookClientId === "string" ? credentials.outlookClientId : "",
+        outlookRefreshToken:
+          typeof credentials.outlookRefreshToken === "string" ? credentials.outlookRefreshToken : "",
+        outlookPassword: typeof credentials.outlookPassword === "string" ? credentials.outlookPassword : "",
       });
       if (platform === "darwin") {
         await saveMacCredential(macRoot, email, payload, securityRunner);
@@ -258,6 +262,10 @@ function parseCredentialPayload(value) {
       password: typeof data.password === "string" ? data.password : "",
       totpSecret: typeof data.totpSecret === "string" ? data.totpSecret : "",
       proxyUrl: typeof data.proxyUrl === "string" ? data.proxyUrl : "",
+      outlookClientId: typeof data.outlookClientId === "string" ? data.outlookClientId : "",
+      outlookRefreshToken:
+        typeof data.outlookRefreshToken === "string" ? data.outlookRefreshToken : "",
+      outlookPassword: typeof data.outlookPassword === "string" ? data.outlookPassword : "",
     };
   } catch {
     // Older macOS writes used the interactive `security -w` prompt, which
@@ -268,6 +276,9 @@ function parseCredentialPayload(value) {
       password: extractCompleteJsonString(raw, "password"),
       totpSecret: extractCompleteJsonString(raw, "totpSecret"),
       proxyUrl: extractCompleteJsonString(raw, "proxyUrl"),
+      outlookClientId: extractCompleteJsonString(raw, "outlookClientId"),
+      outlookRefreshToken: extractCompleteJsonString(raw, "outlookRefreshToken"),
+      outlookPassword: extractCompleteJsonString(raw, "outlookPassword"),
     };
   }
 }
@@ -285,7 +296,7 @@ function extractCompleteJsonString(raw, key) {
 }
 
 function emptyCredentials() {
-  return { password: "", totpSecret: "", proxyUrl: "" };
+  return { password: "", totpSecret: "", proxyUrl: "", outlookClientId: "", outlookRefreshToken: "", outlookPassword: "" };
 }
 
 function isBase64(value) {

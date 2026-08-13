@@ -10,7 +10,15 @@ import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
+import { fetchChatgptCredits } from "./chatgpt-credits.mjs";
 import { fetchMailboxOtpCandidates, validateMailApiUrl } from "./mail-otp.mjs";
+import {
+  DEFAULT_OUTLOOK_ENDPOINT,
+  fetchOutlookOtpCandidates,
+  normalizeOutlookEndpoint,
+  parseOutlookEntries,
+  validateOutlookEndpoint,
+} from "./outlook-mail.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
 import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
 
@@ -28,6 +36,7 @@ const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
+const OUTLOOK_FETCH_CONFIG_FILENAME = "outlook-fetch.json";
 const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
@@ -43,6 +52,7 @@ const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
 );
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
+const OUTLOOK_FETCH_CONFIG_PATH = path.join(OUTPUT_ROOT, OUTLOOK_FETCH_CONFIG_FILENAME);
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
@@ -264,6 +274,59 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/outlook-batch") {
+    const body = await readJson(req);
+    let entries;
+    try {
+      entries = parseOutlookEntries(body.text);
+    } catch (error) {
+      throw httpError(400, error.message);
+    }
+    if (entries.length > MAX_BATCH_JOBS) throw httpError(400, `一次最多添加 ${MAX_BATCH_JOBS} 条任务`);
+    const proxyUrl = normalizeProxyUrl(body.proxyUrl);
+    const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
+      const credentials = {
+        email: entry.email,
+        loginMode: "email_otp",
+        mailApiUrl: null,
+        password: "",
+        totpSecret: "",
+        outlookClientId: entry.outlookClientId,
+        outlookRefreshToken: entry.outlookRefreshToken,
+        outlookPassword: entry.outlookPassword,
+      };
+      const existing = findJobByEmail(entry.email);
+      if (existing) {
+        await updateJobCredentials(existing, credentials, { proxyUrl, hasProxyUpdate: true });
+        return { job: existing, updated: true };
+      }
+      return { job: await startJob(entry.email, credentials, proxyUrl), updated: false };
+    })));
+    sendJson(res, 201, {
+      jobs: results.map((item) => publicJob(item.job)),
+      created: results.filter((item) => !item.updated).length,
+      updated: results.filter((item) => item.updated).length,
+    });
+    return;
+  }
+
+  if (req.method === "GET" && requestUrl.pathname === "/api/outlook-fetch-config") {
+    sendJson(res, 200, await loadOutlookFetchConfig());
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/outlook-fetch-config") {
+    const body = await readJson(req);
+    const rawEndpoint = String(body.endpoint || "").trim();
+    if (rawEndpoint && !validateOutlookEndpoint(rawEndpoint)) {
+      throw httpError(400, "Outlook 取件接口必须是有效的 HTTP 或 HTTPS 地址");
+    }
+    const endpoint = normalizeOutlookEndpoint(rawEndpoint);
+    const saved = await saveOutlookFetchConfig(endpoint);
+    sendJson(res, 200, saved);
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/download-batch") {
     const body = await readJson(req);
     await downloadBatchResult(res, body.ids);
@@ -282,6 +345,17 @@ async function handleApi(req, res, requestUrl) {
     const emails = [...new Set(selected.map((job) => job.email.toLowerCase()))];
     await Promise.all(emails.map((email) => withEmailJobLock(email, () => deleteJobsByEmail(email))));
     sendJson(res, 200, { deleted: emails.length });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/refresh-credits") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids).filter((job) => job.resultSaved);
+    await Promise.all(selected.map((job) => withEmailJobLock(job.email, () => refreshJobCreditBalance(job))));
+    sendJson(res, 200, {
+      jobs: selected.map((job) => publicJob(job)),
+      checked: selected.length,
+    });
     return;
   }
 
@@ -396,36 +470,141 @@ async function handleApi(req, res, requestUrl) {
     const payload = await buildSub2ApiUploadPayload(downloadable);
     const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
 
+    // 未手动指定代理且开启自动选择时，为每个账号独立选择当前绑定账号最少的代理。
+    // 复用一份代理绑定数快照，并在内存中累加本次批量分配，避免整批都选中同一代理。
+    let proxySelection = null;
+    if (!config.proxyId && config.autoSelectProxy) {
+      try {
+        const proxyPayload = await requestSub2Api(config, "/api/v1/admin/proxies/all");
+        const proxies = Array.isArray(proxyPayload) ? proxyPayload : Array.isArray(proxyPayload?.data) ? proxyPayload.data : [];
+        const activeProxyIds = new Set(
+          proxies
+            .filter((proxy) => proxy && Number.isInteger(Number(proxy.id)) && String(proxy.status || "active") === "active")
+            .map((proxy) => Number(proxy.id)),
+        );
+        if (activeProxyIds.size) {
+          const accounts0 = await listAllSub2ApiOpenAiAccounts(config);
+          const counts = new Map();
+          for (const account of accounts0) {
+            const pid = Number(account?.proxy_id);
+            if (Number.isSafeInteger(pid) && pid > 0) counts.set(pid, (counts.get(pid) || 0) + 1);
+          }
+          proxySelection = { activeProxyIds, counts };
+        }
+      } catch (error) {
+        // 自动选代理失败不应阻断上传，降级为不设置 proxy_id（由 Sub2API 用默认代理）
+        proxySelection = null;
+      }
+    }
+
     const accounts = payload.accounts.map((account) => {
       const { proxy_key: _proxyKey, ...accountData } = account;
       const credentials = { ...(account.credentials || {}) };
       if (config.modelWhitelist.length) {
         credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
       }
+      let proxyIdForAccount = config.proxyId || 0;
+      if (!proxyIdForAccount && proxySelection) {
+        // 在快照基础上选最少绑定（并列随机），并立刻在内存累加，保证同批下一个账号看到更新后的计数
+        let minBound = Infinity;
+        const candidates = [];
+        for (const pid of proxySelection.activeProxyIds) {
+          const bound = proxySelection.counts.get(pid) || 0;
+          if (bound < minBound) {
+            minBound = bound;
+            candidates.length = 0;
+            candidates.push(pid);
+          } else if (bound === minBound) {
+            candidates.push(pid);
+          }
+        }
+        if (candidates.length) {
+          proxyIdForAccount = candidates[Math.floor(Math.random() * candidates.length)];
+          proxySelection.counts.set(proxyIdForAccount, (proxySelection.counts.get(proxyIdForAccount) || 0) + 1);
+        }
+      }
+      // 注入「禁用自动暂停」配置到账号 extra（合并，不覆盖已有字段）
+      const extra = { ...(accountData.extra && typeof accountData.extra === "object" ? accountData.extra : {}) };
+      if (config.disableAutoPause5h) extra.auto_pause_5h_disabled = true;
+      else delete extra.auto_pause_5h_disabled;
+      if (config.disableAutoPause7d) extra.auto_pause_7d_disabled = true;
+      else delete extra.auto_pause_7d_disabled;
       return {
         ...accountData,
         credentials,
+        extra,
         status: "active",
         schedulable: true,
         group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
-        ...(config.proxyId ? { proxy_id: config.proxyId } : {}),
+        ...(proxyIdForAccount ? { proxy_id: proxyIdForAccount } : {}),
         ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
         ...(config.loadFactor !== null ? { load_factor: config.loadFactor } : {}),
         ...(config.priority !== null ? { priority: config.priority } : {}),
       };
     });
-    const result = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
-      method: "POST",
-      headers: { "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify({ accounts }),
-    });
+
+    // 上传前查重：按 platform=openai + email 匹配远程已有账户，避免重新授权后上传造成重复。
+    // 已存在的走 PUT 覆盖 credentials + clear-error + 设可调度（与号池监控自动修复路径同构），
+    // 不存在的才走 POST batch 新增。远程账户无 email 的无法匹配，归入新增组（行为与旧版一致）。
+    const existing = await listAllSub2ApiOpenAiAccounts(config);
+    const remoteByEmail = new Map();
+    for (const acc of existing) {
+      const email = sub2ApiAccountEmail(acc);
+      if (email) remoteByEmail.set(email, Number(acc.id));
+    }
+    const toCreate = [];
+    const toUpdate = [];
+    for (const account of accounts) {
+      const email = sub2ApiAccountEmail(account);
+      const accountId = email ? remoteByEmail.get(email) : null;
+      if (Number.isSafeInteger(accountId) && accountId > 0) toUpdate.push({ account, accountId });
+      else toCreate.push(account);
+    }
+
+    // 新增组：保持原有 batch 创建逻辑（含 Idempotency-Key），仅在非空时发送。
+    let createResult = null;
+    if (toCreate.length) {
+      createResult = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify({ accounts: toCreate }),
+      });
+    }
+
+    // 覆盖组：逐条 PUT credentials（本地新授权凭据完整，直接覆盖）+ clear-error + 设可调度。
+    // 单条失败用 try/catch 收集，不中断整批，失败项回传前端供用户查看。
+    const updatedAccountIds = [];
+    const updateFailed = [];
+    for (const { account, accountId } of toUpdate) {
+      try {
+        await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}`, {
+          method: "PUT",
+          body: JSON.stringify({ credentials: account.credentials || {} }),
+        });
+        await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
+          method: "POST",
+          body: "{}",
+        });
+        await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/schedulable`, {
+          method: "POST",
+          body: JSON.stringify({ schedulable: true }),
+        });
+        updatedAccountIds.push(accountId);
+      } catch (error) {
+        updateFailed.push({ accountId, error: String(error?.message || error).slice(0, 500) });
+      }
+    }
 
     sendJson(res, 200, {
       selected: selected.length,
       uploaded: downloadable.length,
       skipped: selected.length - downloadable.length,
+      created: toCreate.length,
+      updated: updatedAccountIds.length,
+      updatedAccountIds,
+      updateFailed,
       groupIds: config.groupIds,
-      result,
+      result: createResult,
     });
     return;
   }
@@ -583,8 +762,16 @@ function normalizeEmailFilter(value) {
 }
 
 async function startJob(email, credentials = {}, proxyUrl = null) {
-  const { loginMode, mailApiUrl, password, totpSecret } = normalizeLoginCredentials(credentials);
-  await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
+  const { loginMode, mailApiUrl, password, totpSecret, outlookClientId, outlookRefreshToken, outlookPassword } =
+    normalizeLoginCredentials(credentials);
+  await saveStoredLoginCredentials(email, {
+    password,
+    totpSecret,
+    proxyUrl,
+    outlookClientId,
+    outlookRefreshToken,
+    outlookPassword,
+  });
   const id = crypto.randomUUID();
   const outputDir = path.join(OUTPUT_ROOT, id);
   const outputPath = path.join(outputDir, "sub2api-import-oauth.json");
@@ -608,6 +795,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     child: null,
     parserTail: "",
     resultSaved: false,
+    creditBalance: null,
     loginMode,
     password,
     totpSecret,
@@ -615,9 +803,14 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     hasTotpCredential: Boolean(totpSecret),
     proxyUrl,
     mailApiUrl,
+    mailSource: resolveMailSource({ mailApiUrl, outlookClientId, outlookRefreshToken }),
+    mailBaselineTime: null,
+    outlookClientId,
+    outlookRefreshToken,
+    outlookPassword,
     mailSeenCandidateKeys: new Set(),
     mailCandidateCounts: new Map(),
-    mailStatus: mailApiUrl ? "baseline" : "manual",
+    mailStatus: mailApiUrl || (outlookClientId && outlookRefreshToken) ? "baseline" : "manual",
     mailApiError: null,
     mailPollRunning: false,
     mailPollToken: null,
@@ -692,7 +885,7 @@ function scheduleQueuedJobs() {
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
-    if (["full", "totp_setup"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
+    if (["full", "totp_setup"].includes(mode) && job.mailSource !== "none") await loadMailboxBaseline(job);
     if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     let tlsProfile = "";
     if (["full", "totp_setup"].includes(mode) && !job.proxyUrl) {
@@ -802,6 +995,40 @@ function launchJob(job, options = {}) {
   });
 }
 
+/**
+ * 查询任务账号的 ChatGPT Credit 余额并写入 job.creditBalance。
+ * 读取导入文件里的 access_token/refresh_token 调 wham/usage；
+ * 若触发 token 刷新，把新 access_token 回写到导入文件。
+ * 失败时记录 creditError 但不阻断主流程。
+ */
+async function refreshJobCreditBalance(job) {
+  if (!job.resultSaved || !(await fileExists(job.outputPath))) return;
+  try {
+    const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+    const account = Array.isArray(data?.accounts) ? data.accounts.find((a) => a?.credentials) : null;
+    if (!account?.credentials) return;
+    const creds = account.credentials;
+    if (!creds.access_token) return;
+    const result = await fetchChatgptCredits({
+      accessToken: creds.access_token,
+      refreshToken: creds.refresh_token,
+      clientId: creds.client_id,
+    });
+    job.creditBalance = result.balance;
+    job.creditError = null;
+    // token 刷新成功时回写导入文件，避免下次还用过期的 access_token
+    if (result.refreshedAccessToken && result.refreshedAccessToken !== creds.access_token) {
+      creds.access_token = result.refreshedAccessToken;
+      const tempPath = `${job.outputPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+      await fs.writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+      await fs.rename(tempPath, job.outputPath);
+    }
+  } catch (error) {
+    job.creditError = String(error?.message || error).slice(0, 200);
+  }
+  touch(job);
+}
+
 async function handleChildClose(job, { code, signal, mode, runId }) {
   if (job.runId !== runId) return;
   stopMailPolling(job);
@@ -823,6 +1050,7 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     job.completedAt = new Date().toISOString();
     touch(job);
     await saveJobMetadata(job);
+    void refreshJobCreditBalance(job).then(() => saveJobMetadata(job)).catch(() => {});
     await finishSub2ApiAutoRepairSuccess(job);
     scheduleQueuedJobs();
     return;
@@ -1271,11 +1499,11 @@ function consumeOutput(job, rawText) {
       "email_otp",
       rejected
         ? "邮箱验证码错误，请重新输入或重新发送"
-        : job.mailApiUrl
+        : job.mailSource !== "none"
           ? "正在等待收码接口返回新验证码，也可以手动输入"
           : "请输入邮箱验证码",
     );
-    if (job.mailApiUrl) void beginMailPolling(job);
+    if (job.mailSource !== "none") void beginMailPolling(job);
   }
   if (scan.includes("Password (q=quit):")) {
     markAuthorizationRequirement(job, "password");
@@ -2072,7 +2300,10 @@ function normalizeSub2ApiConfig(value) {
   const loadFactor = parseOptionalSub2ApiInteger(config.loadFactor, "负载因子", 0, 10000);
   const priority = parseOptionalSub2ApiInteger(config.priority, "优先级", 0, 10000);
   const modelWhitelist = parseSub2ApiModelWhitelist(config.modelWhitelist);
-  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist };
+  const autoSelectProxy = config.autoSelectProxy !== false;
+  const disableAutoPause5h = config.disableAutoPause5h === true;
+  const disableAutoPause7d = config.disableAutoPause7d === true;
+  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, autoSelectProxy, disableAutoPause5h, disableAutoPause7d };
 }
 
 function readDurationEnv(name, fallback, minimum) {
@@ -2447,6 +2678,80 @@ async function listSub2ApiErrorAccounts(config) {
   return accounts;
 }
 
+/**
+ * 分页拉取 Sub2API 中全部 OpenAI 平台账号（不限状态）。
+ * 用于统计每个代理当前绑定的账号数量。
+ */
+async function listAllSub2ApiOpenAiAccounts(config) {
+  const accounts = [];
+  let page = 1;
+  let pages = 1;
+  do {
+    const query = new URLSearchParams({ page: String(page), page_size: "100", platform: "openai" });
+    const payload = await requestSub2Api(config, `/api/v1/admin/accounts?${query}`);
+    const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+    const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
+    accounts.push(...items.filter((account) => account && String(account.platform || "openai") === "openai"));
+    const reportedPages = Number(data?.pages);
+    pages = Number.isSafeInteger(reportedPages) && reportedPages > 0
+      ? reportedPages
+      : items.length >= 100 ? page + 1 : page;
+    page += 1;
+  } while (page <= pages && page <= 1_000);
+  return accounts;
+}
+
+/**
+ * 从 Sub2API 代理池中选择当前绑定账号最少的可用代理。
+ * - 只考虑 active 状态的代理。
+ * - 统计所有 OpenAI 账号的 proxy_id 分布。
+ * - 绑定数最少的代理中随机选一个（并列时随机）。
+ * - 没有可用代理时返回 null（调用方应跳过自动选择，不设置 proxy_id）。
+ *
+ * @param {object} counts - 已统计的 proxyId→账号数 映射（可选，用于批量场景复用）
+ * @param {object} activeProxyIds - 已获取的可用代理 id 集合（可选，用于批量场景复用）
+ * @returns {Promise<{proxyId: number, bound: number}|null>}
+ */
+async function selectLeastBoundSub2ApiProxy(config, { counts, activeProxyIds } = {}) {
+  if (!activeProxyIds) {
+    const proxyPayload = await requestSub2Api(config, "/api/v1/admin/proxies/all");
+    const proxies = Array.isArray(proxyPayload) ? proxyPayload : Array.isArray(proxyPayload?.data) ? proxyPayload.data : [];
+    activeProxyIds = new Set(
+      proxies
+        .filter((proxy) => proxy && Number.isInteger(Number(proxy.id)) && String(proxy.status || "active") === "active")
+        .map((proxy) => Number(proxy.id)),
+    );
+  }
+  if (!activeProxyIds.size) return null;
+
+  if (!counts) {
+    const accounts = await listAllSub2ApiOpenAiAccounts(config);
+    counts = new Map();
+    for (const account of accounts) {
+      const proxyId = Number(account?.proxy_id);
+      if (Number.isSafeInteger(proxyId) && proxyId > 0) {
+        counts.set(proxyId, (counts.get(proxyId) || 0) + 1);
+      }
+    }
+  }
+
+  let minBound = Infinity;
+  const candidates = [];
+  for (const proxyId of activeProxyIds) {
+    const bound = counts.get(proxyId) || 0;
+    if (bound < minBound) {
+      minBound = bound;
+      candidates.length = 0;
+      candidates.push(proxyId);
+    } else if (bound === minBound) {
+      candidates.push(proxyId);
+    }
+  }
+  if (!candidates.length) return null;
+  const proxyId = candidates[Math.floor(Math.random() * candidates.length)];
+  return { proxyId, bound: minBound };
+}
+
 function sub2ApiAccountEmail(account) {
   const direct = [account?.credentials?.email, account?.extra?.email]
     .map((value) => String(value || "").trim().toLowerCase())
@@ -2479,9 +2784,9 @@ function getAutoRepairEligibility(job) {
   if (!job.lastAuthAutomated) return { eligible: false, reason: job.lastAuthAutomationReason || "上次授权不是全自动完成" };
   const requirements = job.lastAuthRequirements || {};
   if (requirements.password && !job.password) return { eligible: false, reason: "已保存的密码无法读取" };
-  if (requirements.emailOtp && !job.mailApiUrl) return { eligible: false, reason: "缺少可自动收取邮箱验证码的 API" };
+  if (requirements.emailOtp && job.mailSource === "none") return { eligible: false, reason: "缺少可自动收取邮箱验证码的 API" };
   if (requirements.mfa && !job.totpSecret) return { eligible: false, reason: "已保存的 2FA 密钥无法读取" };
-  if (!job.password && !job.mailApiUrl) return { eligible: false, reason: "缺少可自动登录的密码或邮件收码 API" };
+  if (!job.password && job.mailSource === "none") return { eligible: false, reason: "缺少可自动登录的密码或邮件收码 API" };
   if (job.hasTotpCredential && !job.totpSecret) return { eligible: false, reason: "2FA 密钥在当前系统上无法恢复" };
   return { eligible: true, reason: "上次完整登录全自动完成，所需资料仍可用" };
 }
@@ -2586,6 +2891,20 @@ async function exportSourceAccounts(res, ids) {
     if (job.hasTotpCredential && !totpSecret) {
       throw httpError(409, `${job.email} 的 2FA 密钥未能从系统安全凭据存储读取，请重新导入该账号资料`);
     }
+    if (job.mailSource === "outlook") {
+      let { outlookClientId, outlookRefreshToken, outlookPassword } = job;
+      if ((!outlookClientId || !outlookRefreshToken || !outlookPassword)) {
+        const stored = await loadStoredLoginCredentials(job.email);
+        outlookClientId ||= stored.outlookClientId;
+        outlookRefreshToken ||= stored.outlookRefreshToken;
+        outlookPassword ||= stored.outlookPassword;
+      }
+      if (!outlookRefreshToken) {
+        throw httpError(409, `${job.email} 的 Outlook 刷新令牌未能从系统安全凭据存储读取，请重新导入该账号资料`);
+      }
+      lines.push(`${job.email}----${outlookPassword || ""}----${outlookClientId || ""}----${outlookRefreshToken}`);
+      continue;
+    }
     if (password) {
       const parts = [job.email, password];
       if (job.mailApiUrl) parts.push(job.mailApiUrl);
@@ -2629,9 +2948,13 @@ function publicJob(job) {
     completedAt: job.completedAt,
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
-    loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
+    creditBalance: job.creditBalance ?? null,
+    creditError: job.creditError || null,
+    loginMode: job.loginMode || (job.mailSource === "none" ? "manual" : "email_otp"),
     hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
-    autoEmailOtp: Boolean(job.mailApiUrl),
+    autoEmailOtp: job.mailSource !== "none",
+    mailSource: job.mailSource || "none",
+    hasOutlookCredential: Boolean(job.outlookRefreshToken),
     mailStatus: job.mailStatus,
     mailApiError: job.mailApiError,
     currentPhone: job.currentPhone,
@@ -2744,7 +3067,7 @@ function completeAuthorizationAutomationAttempt(job) {
   }
   const hasAutomaticLoginSource = attempt.requirements.password
     || attempt.requirements.emailOtp
-    || Boolean(job.password || job.mailApiUrl);
+    || Boolean(job.password || job.mailSource !== "none");
   if (!hasAutomaticLoginSource) reasons.push("没有可用于下次自动登录的密码或邮件收码接口");
 
   job.lastAuthAutomated = reasons.length === 0;
@@ -2920,7 +3243,8 @@ async function syncCompletedOutputs(force = false) {
         if (data.type !== "sub2api-data" || !Array.isArray(data.accounts) || !data.accounts.length) throw new Error("invalid output");
         const account = data.accounts[0];
         const email = metadata.email || account?.credentials?.email || account?.extra?.email || account?.name || `restored-${entry.name}`;
-        const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
+        const mailState = resolveRestoredMailState(metadata, await loadStoredLoginCredentials(email));
+        const mailApiUrl = mailState.mailApiUrl;
         let storedCredentials = await loadStoredLoginCredentials(email);
         const completedAt = stat.mtime.toISOString();
         const updatedAt = metadata.updated_at || completedAt;
@@ -2947,15 +3271,22 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: true,
-          loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
+          creditBalance: null,
+          creditError: null,
+          loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailState.mailSource !== "none" ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
           ...restoredCredentialFlags(metadata, storedCredentials),
           mailApiUrl,
+          mailSource: mailState.mailSource,
+          mailBaselineTime: mailState.mailBaselineTime,
+          outlookClientId: mailState.outlookClientId,
+          outlookRefreshToken: mailState.outlookRefreshToken,
+          outlookPassword: mailState.outlookPassword,
           proxyUrl: storedCredentials.proxyUrl,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
-          mailStatus: mailApiUrl ? "ready" : "manual",
+          mailStatus: mailState.mailSource !== "none" ? "ready" : "manual",
           mailApiError: null,
           mailPollRunning: false,
           mailPollToken: null,
@@ -2980,9 +3311,10 @@ async function syncCompletedOutputs(force = false) {
         const [raw, stat] = await Promise.all([fs.readFile(checkpointPath, "utf8"), fs.stat(checkpointPath)]);
         const checkpoint = JSON.parse(raw);
         if (checkpoint?.version !== 1 || typeof checkpoint.email !== "string" || !checkpoint.email) return;
-        const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
         const email = metadata.email || checkpoint.email;
         const storedCredentials = await loadStoredLoginCredentials(email);
+        const mailState = resolveRestoredMailState(metadata, storedCredentials);
+        const mailApiUrl = mailState.mailApiUrl;
         const restoredAt = stat.mtime.toISOString();
         const savedStatus = String(metadata.status || "");
         const restoredStatus = isTerminalStatus(savedStatus) ? savedStatus : "resume_available";
@@ -3006,15 +3338,22 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: false,
-          loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
+          creditBalance: null,
+          creditError: null,
+          loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailState.mailSource !== "none" ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
           ...restoredCredentialFlags(metadata, storedCredentials),
           mailApiUrl,
+          mailSource: mailState.mailSource,
+          mailBaselineTime: mailState.mailBaselineTime,
+          outlookClientId: mailState.outlookClientId,
+          outlookRefreshToken: mailState.outlookRefreshToken,
+          outlookPassword: mailState.outlookPassword,
           proxyUrl: storedCredentials.proxyUrl,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
-          mailStatus: mailApiUrl ? "ready" : "manual",
+          mailStatus: mailState.mailSource !== "none" ? "ready" : "manual",
           mailApiError: null,
           mailPollRunning: false,
           mailPollToken: null,
@@ -3037,7 +3376,8 @@ async function syncCompletedOutputs(force = false) {
           || !isEmail(metadata.email)
         ) return;
         const storedCredentials = await loadStoredLoginCredentials(metadata.email);
-        const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
+        const mailState = resolveRestoredMailState(metadata, storedCredentials);
+        const mailApiUrl = mailState.mailApiUrl;
         const restoredAt = metadata.updated_at || new Date().toISOString();
         const missingStoredCredentials = restoredMissingCredentials(metadata, storedCredentials);
         const storedCredentialsMissing = missingStoredCredentials.length > 0;
@@ -3085,15 +3425,22 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: false,
-          loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
+          creditBalance: null,
+          creditError: null,
+          loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailState.mailSource !== "none" ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
           ...restoredCredentialFlags(metadata, storedCredentials),
           mailApiUrl,
+          mailSource: mailState.mailSource,
+          mailBaselineTime: mailState.mailBaselineTime,
+          outlookClientId: mailState.outlookClientId,
+          outlookRefreshToken: mailState.outlookRefreshToken,
+          outlookPassword: mailState.outlookPassword,
           proxyUrl: storedCredentials.proxyUrl,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
-          mailStatus: mailApiUrl ? "baseline" : "manual",
+          mailStatus: mailState.mailSource !== "none" ? "baseline" : "manual",
           mailApiError: null,
           mailPollRunning: false,
           mailPollToken: null,
@@ -3223,8 +3570,39 @@ function normalizeLoginCredentials(value = {}) {
   const password = typeof value.password === "string" ? value.password : "";
   const mailApiUrl = validateMailApiUrl(value.mailApiUrl) ? String(value.mailApiUrl).trim() : null;
   const totpSecret = value.totpSecret ? normalizeTotpSecret(value.totpSecret) : "";
+  const outlookClientId = typeof value.outlookClientId === "string" ? value.outlookClientId.trim() : "";
+  const outlookRefreshToken =
+    typeof value.outlookRefreshToken === "string" ? value.outlookRefreshToken.trim() : "";
+  const outlookPassword = typeof value.outlookPassword === "string" ? value.outlookPassword.trim() : "";
   const loginMode = password ? "password" : "email_otp";
-  return { loginMode, mailApiUrl, password, totpSecret };
+  return { loginMode, mailApiUrl, password, totpSecret, outlookClientId, outlookRefreshToken, outlookPassword };
+}
+
+/**
+ * 恢复任务时根据元数据和已存储凭据，解析邮件源类型与相关字段。
+ * 返回的 outlook 字段直接来自凭据存储（加密），mailSource 来自元数据标记。
+ */
+function resolveRestoredMailState(metadata, storedCredentials) {
+  const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
+  const mailSource = resolveMailSource({
+    mailApiUrl,
+    outlookClientId: storedCredentials.outlookClientId,
+    outlookRefreshToken: storedCredentials.outlookRefreshToken,
+  });
+  return {
+    mailApiUrl,
+    mailSource,
+    mailBaselineTime: null,
+    outlookClientId: storedCredentials.outlookClientId || "",
+    outlookRefreshToken: storedCredentials.outlookRefreshToken || "",
+    outlookPassword: storedCredentials.outlookPassword || "",
+  };
+}
+
+function resolveMailSource({ mailApiUrl, outlookClientId, outlookRefreshToken } = {}) {
+  if (mailApiUrl) return "api";
+  if (outlookClientId && outlookRefreshToken) return "outlook";
+  return "none";
 }
 
 function restoredCredentialFlags(metadata = {}, credentials = {}) {
@@ -3411,14 +3789,22 @@ async function updateJobCredentials(job, credentials, options = {}) {
         password: job.password,
         mailApiUrl: job.mailApiUrl,
         totpSecret: job.totpSecret,
+        outlookClientId: job.outlookClientId,
+        outlookRefreshToken: job.outlookRefreshToken,
+        outlookPassword: job.outlookPassword,
       })
     : normalizeLoginCredentials(credentials);
   const nextProxyUrl = options.hasProxyUpdate ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl;
+  const nextMailSource = resolveMailSource(normalized);
   const changed = job.loginMode !== normalized.loginMode
     || job.mailApiUrl !== normalized.mailApiUrl
     || job.password !== normalized.password
     || job.totpSecret !== normalized.totpSecret
-    || job.proxyUrl !== nextProxyUrl;
+    || job.proxyUrl !== nextProxyUrl
+    || job.outlookClientId !== normalized.outlookClientId
+    || job.outlookRefreshToken !== normalized.outlookRefreshToken
+    || job.outlookPassword !== normalized.outlookPassword
+    || job.mailSource !== nextMailSource;
   await saveStoredLoginCredentials(job.email, { ...normalized, proxyUrl: nextProxyUrl });
   if (!changed) return;
   stopMailPolling(job);
@@ -3426,12 +3812,17 @@ async function updateJobCredentials(job, credentials, options = {}) {
   job.mailApiUrl = normalized.mailApiUrl;
   job.password = normalized.password;
   job.totpSecret = normalized.totpSecret;
+  job.outlookClientId = normalized.outlookClientId;
+  job.outlookRefreshToken = normalized.outlookRefreshToken;
+  job.outlookPassword = normalized.outlookPassword;
+  job.mailSource = nextMailSource;
+  job.mailBaselineTime = null;
   job.hasPasswordCredential = Boolean(normalized.password);
   job.hasTotpCredential = Boolean(normalized.totpSecret);
   job.proxyUrl = nextProxyUrl;
   job.mailSeenCandidateKeys.clear();
   job.mailCandidateCounts.clear();
-  job.mailStatus = job.mailApiUrl ? "baseline" : "manual";
+  job.mailStatus = nextMailSource !== "none" ? "baseline" : "manual";
   job.mailApiError = null;
   appendJobLog(job, "[account] 登录方式与验证资料已按邮箱唯一键更新，敏感字段未写入日志。\n");
   if (isActive(job.status) && job.status !== "queued") {
@@ -3503,6 +3894,7 @@ async function saveJobMetadata(job) {
         proxy_connection_failure_count: Number(job.proxyConnectionFailureCount || 0),
         proxy_configured: Boolean(job.proxyUrl),
         mail_api_url: job.mailApiUrl || null,
+        mail_source: job.mailSource || "none",
         sms_provider_id: job.smsProviderId || null,
         sms_provider_name: job.smsProviderName || null,
         sms_service_label: job.smsServiceLabel || null,
@@ -3534,12 +3926,23 @@ async function saveStoredLoginCredentials(email, credentials = {}) {
   const password = typeof credentials.password === "string" ? credentials.password : "";
   const totpSecret = credentials.totpSecret ? normalizeTotpSecret(credentials.totpSecret) : "";
   const proxyUrl = credentials.proxyUrl ? normalizeProxyUrl(credentials.proxyUrl) : "";
-  if (!password && !totpSecret && !proxyUrl) {
+  const outlookClientId = typeof credentials.outlookClientId === "string" ? credentials.outlookClientId : "";
+  const outlookRefreshToken =
+    typeof credentials.outlookRefreshToken === "string" ? credentials.outlookRefreshToken : "";
+  const outlookPassword = typeof credentials.outlookPassword === "string" ? credentials.outlookPassword : "";
+  if (!password && !totpSecret && !proxyUrl && !outlookRefreshToken) {
     await deleteStoredLoginCredentials(email);
     return true;
   }
   try {
-    await credentialStore.save(email, { password, totpSecret, proxyUrl });
+    await credentialStore.save(email, {
+      password,
+      totpSecret,
+      proxyUrl,
+      outlookClientId,
+      outlookRefreshToken,
+      outlookPassword,
+    });
   } catch (error) {
     if (error?.status === 501) return false;
     throw error;
@@ -3554,9 +3957,19 @@ async function loadStoredLoginCredentials(email) {
       password: typeof data.password === "string" ? data.password : "",
       totpSecret: data.totpSecret ? normalizeTotpSecret(data.totpSecret) : "",
       proxyUrl: data.proxyUrl ? normalizeProxyUrl(data.proxyUrl) : null,
+      outlookClientId: typeof data.outlookClientId === "string" ? data.outlookClientId : "",
+      outlookRefreshToken: typeof data.outlookRefreshToken === "string" ? data.outlookRefreshToken : "",
+      outlookPassword: typeof data.outlookPassword === "string" ? data.outlookPassword : "",
     };
   } catch {
-    return { password: "", totpSecret: "", proxyUrl: null };
+    return {
+      password: "",
+      totpSecret: "",
+      proxyUrl: null,
+      outlookClientId: "",
+      outlookRefreshToken: "",
+      outlookPassword: "",
+    };
   }
 }
 
@@ -3564,9 +3977,53 @@ async function deleteStoredLoginCredentials(email) {
   await credentialStore.delete(email);
 }
 
-async function loadMailboxBaseline(job) {
+async function loadOutlookFetchConfig() {
   try {
-    const candidates = await fetchMailboxOtpCandidates(job.mailApiUrl);
+    const raw = await fs.readFile(OUTLOOK_FETCH_CONFIG_PATH, "utf8");
+    const data = JSON.parse(raw);
+    return { endpoint: normalizeOutlookEndpoint(data.endpoint) };
+  } catch {
+    return { endpoint: DEFAULT_OUTLOOK_ENDPOINT };
+  }
+}
+
+async function saveOutlookFetchConfig(endpoint) {
+  const normalized = normalizeOutlookEndpoint(endpoint);
+  await fs.mkdir(path.dirname(OUTLOOK_FETCH_CONFIG_PATH), { recursive: true });
+  const tempPath = `${OUTLOOK_FETCH_CONFIG_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(tempPath, `${JSON.stringify({ endpoint: normalized }, null, 2)}\n`, { mode: 0o600 });
+  await fs.rename(tempPath, OUTLOOK_FETCH_CONFIG_PATH);
+  return { endpoint: normalized };
+}
+
+/**
+ * 统一收码分发：根据 job 的邮件源类型，调用 GET 收码接口或 Outlook fetch-mails 接口。
+ * 两者都返回结构一致的 candidate 列表，后续 baseline/轮询逻辑完全复用。
+ */
+async function fetchJobOtpCandidates(job, { baselineTime = null } = {}) {
+  if (job.mailSource === "outlook") {
+    const { endpoint } = await loadOutlookFetchConfig();
+    return fetchOutlookOtpCandidates(
+      {
+        endpoint,
+        email: job.email,
+        clientId: job.outlookClientId,
+        refreshToken: job.outlookRefreshToken,
+        password: job.outlookPassword,
+      },
+      { baselineTime },
+    );
+  }
+  return fetchMailboxOtpCandidates(job.mailApiUrl);
+}
+
+async function loadMailboxBaseline(job) {
+  if (job.mailSource !== "api" && job.mailSource !== "outlook") return;
+  // 记录基准时间：登录触发后到达的邮件才视为新验证码。
+  // 设置在抓取之前，确保不会把"设置基准时间"瞬间正在投递的旧邮件误判为新码。
+  job.mailBaselineTime = Date.now();
+  try {
+    const candidates = await fetchJobOtpCandidates(job, { baselineTime: null });
     candidates.forEach((candidate) => job.mailSeenCandidateKeys.add(candidate.key));
     job.mailStatus = "ready";
     job.mailApiError = null;
@@ -3580,7 +4037,7 @@ async function loadMailboxBaseline(job) {
 }
 
 async function beginMailPolling(job) {
-  if (!job.mailApiUrl || job.mailPollRunning || job.status !== "email_otp") return;
+  if (job.mailSource === "none" || job.mailPollRunning || job.status !== "email_otp") return;
   job.mailPollRunning = true;
   job.mailStatus = "polling";
   job.mailApiError = null;
@@ -3597,7 +4054,7 @@ async function beginMailPolling(job) {
       Date.now() - startedAt < MAIL_POLL_TIMEOUT_MS
     ) {
       try {
-        const candidates = await fetchMailboxOtpCandidates(job.mailApiUrl);
+        const candidates = await fetchJobOtpCandidates(job, { baselineTime: job.mailBaselineTime });
         if (job.mailPollToken !== pollToken || job.status !== "email_otp" || !job.child) return;
         const unseen = candidates.filter((candidate) => !job.mailSeenCandidateKeys.has(candidate.key));
         let fresh = unseen.find((candidate) => candidate.score >= 12);
@@ -3645,7 +4102,7 @@ async function beginMailPolling(job) {
 }
 
 function stopMailPolling(job) {
-  if (!job.mailApiUrl) return;
+  if (job.mailSource === "none") return;
   job.mailPollToken = null;
   job.mailPollRunning = false;
   if (job.mailStatus === "polling") job.mailStatus = "stopped";
