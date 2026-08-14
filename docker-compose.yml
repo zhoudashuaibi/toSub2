@@ -1,7 +1,10 @@
 services:
   tosub2:
+    # ── 镜像来源（二选一）──
+    # 服务器部署：直接拉 GitHub Actions 发布的镜像，docker compose pull && docker compose up -d 即可更新
+    # 本地自建：docker compose up -d --build 会用下面的 build 忽略上面的 image
+    image: ghcr.io/zhoudashuaibi/tosub2:latest
     build: .
-    image: tosub2:latest
     container_name: tosub2
     restart: unless-stopped
     ports:

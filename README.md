@@ -144,6 +144,35 @@ npm run dev
 
 项目自带 `Dockerfile`、`docker-compose.yml` 和 `.dockerignore`，镜像基于 Node 22 + Python 3（Debian slim），内置 `curl_cffi` 和正确的 PID 1 信号处理（`tini`），适合长时间在服务器上运行。
 
+每次推送到 `main`（或打 `v*` 标签）时，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64` 双架构镜像并发布到 GHCR：`ghcr.io/zhoudashuaibi/tosub2`。服务器上无需克隆源码、无需本地构建，直接拉镜像即可。
+
+#### 方式一：拉取 CI 发布的镜像（服务器推荐）
+
+```bash
+# 0. 首次使用：到 GitHub 仓库页面 → Packages → tosub2 → Package settings
+#    把可见性改为 Public（否则服务器上 docker pull 会提示 denied）。
+#    也可以保持私有，但服务器上需要先：
+#    echo 你的GitHub访问令牌 | docker login ghcr.io -u 你的GitHub用户名 --password-stdin
+#    （令牌需勾选 read:packages 权限）
+
+# 1. 在服务器上建一个目录，放入 docker-compose.yml（scp 过去，或 git clone 本仓库）
+
+# 2. 配置访问密码（公网部署必填，本机自用可跳过）
+echo 'TOSUB2_CONSOLE_PASSWORD=你的强密码' > .env
+
+# 3. 拉取镜像并后台启动
+docker compose pull
+docker compose up -d
+
+# 4. 查看日志 / 状态
+docker compose logs -f
+docker compose ps
+```
+
+镜像标签规则：`main` 分支推送 → `latest`；打 `v1.5.4` 这样的标签 → `1.5.4`、`1.5`。想固定版本就把 compose 里的 `image` 改成 `ghcr.io/zhoudashuaibi/tosub2:1.5.4`。
+
+#### 方式二：本地构建（无 GHCR 镜像 / 离线服务器）
+
 **最快上手**（在项目根目录）：
 
 ```bash
@@ -175,8 +204,13 @@ docker compose ps
 **更新版本**：
 
 ```bash
+# 方式一（拉取 CI 镜像部署的）：
+docker compose pull             # 拉最新镜像
+docker compose up -d            # 替换旧容器，数据卷不变
+
+# 方式二（本地构建部署的）：
 git pull
-docker compose up -d --build   # 重新构建并替换旧容器，数据卷不变
+docker compose up -d --build    # 重新构建并替换旧容器，数据卷不变
 ```
 
 **数据备份**：只需备份项目根目录的 `data/` 文件夹，里面包含所有任务产物和号池配置。
