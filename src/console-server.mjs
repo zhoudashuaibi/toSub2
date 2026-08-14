@@ -172,6 +172,9 @@ const vite = await createViteServer({
   plugins: [react()],
   server: {
     middlewareMode: true,
+    // 反向代理场景下 Host 可能是任意域名（如 tosub.aimeta.store），放开 Vite 6 的域名白名单；
+    // 对外安全由 TOSUB2_CONSOLE_PASSWORD 访问密码 + HTTPS 反代保证，不依赖此层 Host 校验
+    allowedHosts: true,
     hmr: { port: hmrPort, clientPort: hmrPort },
   },
 });
