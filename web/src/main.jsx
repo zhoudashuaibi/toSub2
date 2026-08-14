@@ -28,6 +28,7 @@ import {
   Smartphone,
   PhoneIncoming,
   Trash2,
+  Upload,
   X,
 } from "lucide-react";
 import "./styles.css";
@@ -47,6 +48,7 @@ const REGION_NAMES = typeof Intl.DisplayNames === "function"
 function App() {
   const [token, setToken] = useState("");
   const [features, setFeatures] = useState({});
+  const [authRequired, setAuthRequired] = useState(false);
   const [jobs, setJobs] = useState([]);
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
@@ -103,26 +105,65 @@ function App() {
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
+  // 备用号池状态
+  const [reservePool, setReservePool] = useState({ accounts: [], available: 0, total: 0 });
+  const [reservePoolOpen, setReservePoolOpen] = useState(false);
+  const [reserveImportOpen, setReserveImportOpen] = useState(false);
+  const [reserveImportText, setReserveImportText] = useState("");
+  const [reserveImportError, setReserveImportError] = useState("");
+  const [reserveImporting, setReserveImporting] = useState(false);
+  const [reserveRefreshing, setReserveRefreshing] = useState(false);
+  const [reserveClearing, setReserveClearing] = useState(false);
+  const [selectedReserveEmails, setSelectedReserveEmails] = useState(new Set());
+
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
   useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
   useEffect(() => writeLocalJson(OUTLOOK_FETCH_SETTINGS_KEY, outlookSettings), [outlookSettings]);
+
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
 
   useEffect(() => {
     let stopped = false;
     fetch("/api/bootstrap")
       .then(readResponse)
       .then((data) => {
-        if (!stopped) {
-          setToken(data.token);
-          setFeatures(data.features || {});
+        if (stopped) return;
+        if (data && data.authRequired) {
+          setAuthRequired(true);
+          return;
         }
+        setToken(data.token);
+        setFeatures(data.features || {});
       })
       .catch((requestError) => setError(requestError.message));
     return () => {
       stopped = true;
     };
   }, []);
+
+  async function submitLogin(event) {
+    event.preventDefault();
+    if (loginBusy) return;
+    setLoginBusy(true);
+    setLoginError("");
+    try {
+      const data = await apiFetch(null, "/api/login", {
+        method: "POST",
+        body: JSON.stringify({ password: loginPassword }),
+      });
+      setToken(data.token);
+      setFeatures(data.features || {});
+      setAuthRequired(false);
+      setLoginPassword("");
+    } catch (requestError) {
+      setLoginError(requestError.message);
+    } finally {
+      setLoginBusy(false);
+    }
+  }
 
   useEffect(() => {
     if (!token) return undefined;
@@ -176,6 +217,129 @@ function App() {
       window.clearInterval(timer);
     };
   }, [token, features.sub2apiMonitor]);
+
+  // 备用号池轮询：每 10 秒刷新一次（仅在面板展开时）
+  useEffect(() => {
+    if (!token || !reservePoolOpen) return undefined;
+    let stopped = false;
+    const load = async () => {
+      try {
+        const data = await apiFetch(token, "/api/reserve-pool");
+        if (!stopped) setReservePool(data);
+      } catch {}
+    };
+    void load();
+    const timer = window.setInterval(load, 10_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [token, reservePoolOpen]);
+
+  async function importReservePool() {
+    if (!reserveImportText.trim()) {
+      setReserveImportError("请粘贴至少一行账号信息");
+      return;
+    }
+    setReserveImporting(true);
+    setReserveImportError("");
+    try {
+      const data = await apiFetch(token, "/api/reserve-pool/import", {
+        method: "POST",
+        body: JSON.stringify({ text: reserveImportText, config: sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey ? sub2apiSettings : undefined }),
+      });
+      setReservePool({ accounts: data.accounts, available: data.available, total: data.total });
+      setReserveImportText("");
+      setReserveImportOpen(false);
+      // 如果有跳过或重复，提示用户
+      const parts = [`新增 ${data.created} 个`];
+      if (data.skipped) parts.push(`备用号池已有 ${data.skipped} 个`);
+      if (data.duplicated) parts.push(`已在号池/任务中 ${data.duplicated} 个`);
+      if (data.skipped || data.duplicated) {
+        setUploadNotice(`备用号池导入完成：${parts.join("，")}`);
+      }
+    } catch (error) {
+      setReserveImportError(error.message);
+    } finally {
+      setReserveImporting(false);
+    }
+  }
+
+  async function refreshReservePool(email) {
+    setReserveRefreshing(true);
+    try {
+      const data = await apiFetch(token, "/api/reserve-pool/refresh", {
+        method: "POST",
+        body: JSON.stringify(email ? { email } : {}),
+      });
+      setReservePool({ accounts: data.accounts, available: data.available, total: data.total });
+    } catch {} finally {
+      setReserveRefreshing(false);
+    }
+  }
+
+  async function joinReservePool(email) {
+    try {
+      await apiFetch(token, "/api/reserve-pool/join", {
+        method: "POST",
+        body: JSON.stringify({ email, config: sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey ? sub2apiSettings : undefined }),
+      });
+      // 立即刷新状态显示 joining
+      const data = await apiFetch(token, "/api/reserve-pool");
+      setReservePool({ accounts: data.accounts, available: data.available, total: data.total });
+    } catch (error) {
+      window.alert(error.message);
+    }
+  }
+
+  async function deleteReservePool(email) {
+    try {
+      const data = await apiFetch(token, "/api/reserve-pool", {
+        method: "DELETE",
+        body: JSON.stringify({ email }),
+      });
+      setReservePool({ accounts: data.accounts, available: data.available, total: data.total });
+    } catch (error) {
+      window.alert(error.message);
+    }
+  }
+
+  async function deleteSelectedReservePool() {
+    const emails = [...selectedReserveEmails];
+    if (!emails.length) return;
+    if (!window.confirm(`确定删除选中的 ${emails.length} 个账号吗？`)) return;
+    setReserveClearing(true);
+    try {
+      const data = await apiFetch(token, "/api/reserve-pool/clear", {
+        method: "POST",
+        body: JSON.stringify({ emails }),
+      });
+      setReservePool({ accounts: data.accounts, available: data.available, total: data.total });
+      setSelectedReserveEmails(new Set());
+    } catch (error) {
+      window.alert(error.message);
+    } finally {
+      setReserveClearing(false);
+    }
+  }
+
+  function toggleReserveSelection(email) {
+    setSelectedReserveEmails((current) => {
+      const next = new Set(current);
+      if (next.has(email)) next.delete(email);
+      else next.add(email);
+      return next;
+    });
+  }
+
+  function toggleAllReserveSelection() {
+    const allEmails = reservePool.accounts.map((acc) => acc.email);
+    if (selectedReserveEmails.size === allEmails.length && allEmails.length > 0) {
+      setSelectedReserveEmails(new Set());
+    } else {
+      setSelectedReserveEmails(new Set(allEmails));
+    }
+  }
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
   const smsProviderDefinitions = Array.isArray(features.smsProviders) ? features.smsProviders : [];
@@ -711,6 +875,47 @@ function App() {
     }
   }
 
+  if (authRequired && !token) {
+    return (
+      <div className="modal-backdrop login-gate-backdrop" role="presentation">
+        <form className="batch-dialog login-gate-dialog" onSubmit={submitLogin} role="dialog" aria-modal="true" aria-labelledby="login-gate-title">
+          <div className="dialog-header">
+            <div>
+              <div className="login-gate-brand"><ShieldCheck size={22} strokeWidth={2.2} /></div>
+              <h2 id="login-gate-title">访问验证</h2>
+            </div>
+          </div>
+          <p className="login-gate-hint">请输入访问密码以进入控制台</p>
+          <label className="settings-field wide-settings-field login-gate-field">
+            <span>访问密码</span>
+            <div>
+              <KeyRound size={15} />
+              <input
+                type="password"
+                value={loginPassword}
+                onChange={(event) => setLoginPassword(event.target.value)}
+                placeholder="输入访问密码"
+                autoComplete="current-password"
+                autoFocus
+                disabled={loginBusy}
+                required
+              />
+            </div>
+          </label>
+          {loginError && (
+            <div className="dialog-error" role="alert"><CircleAlert size={15} />{loginError}</div>
+          )}
+          <div className="dialog-footer">
+            <button type="submit" className="primary-button login-gate-submit" disabled={loginBusy || !loginPassword}>
+              {loginBusy ? <LoaderCircle className="spin" size={17} /> : <LogIn size={17} />}
+              进入控制台
+            </button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -873,6 +1078,124 @@ function App() {
             <Check size={17} />
             <span>{uploadNotice}</span>
             <button type="button" onClick={() => setUploadNotice("")} title="关闭"><X size={16} /></button>
+          </div>
+        )}
+
+        {features.sub2apiMonitor && (
+          <div className="reserve-pool-section">
+            <div className="reserve-pool-header">
+              <button
+                type="button"
+                className="reserve-pool-toggle"
+                onClick={() => setReservePoolOpen((current) => !current)}
+              >
+                {reservePoolOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <strong>备用号池</strong>
+                <span className="reserve-pool-summary">
+                  {reservePool.available} 个可用 / {reservePool.total} 个总计
+                </span>
+              </button>
+              <div className="reserve-pool-actions">
+                <button type="button" className="secondary-button" onClick={() => setReserveImportOpen(true)} disabled={!token}>
+                  <Upload size={14} />导入
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button reserve-clear-btn"
+                  onClick={() => deleteSelectedReservePool()}
+                  disabled={!token || !selectedReserveEmails.size || reserveClearing}
+                >
+                  {reserveClearing ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}删除选中{selectedReserveEmails.size ? ` (${selectedReserveEmails.size})` : ""}
+                </button>
+                <button type="button" className="secondary-button" onClick={() => refreshReservePool()} disabled={!token || reserveRefreshing || !reservePool.total}>
+                  {reserveRefreshing ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}全部刷新
+                </button>
+              </div>
+            </div>
+            {reservePoolOpen && (
+              <div className="reserve-pool-table-wrapper">
+                {reservePool.accounts.length === 0 ? (
+                  <div className="reserve-pool-empty">备用号池为空，点击「导入」添加 Outlook 账号</div>
+                ) : (
+                  <table className="reserve-pool-table">
+                    <thead>
+                      <tr>
+                        <th className="reserve-pool-check-col">
+                          <input
+                            type="checkbox"
+                            checked={reservePool.accounts.length > 0 && selectedReserveEmails.size === reservePool.accounts.length}
+                            onChange={toggleAllReserveSelection}
+                            aria-label="全选备用号池"
+                          />
+                        </th>
+                        <th>邮箱 <span className="reserve-th-status">状态</span></th>
+                        <th className="reserve-pool-center-col">余额</th>
+                        <th className="reserve-pool-actions-col">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {reservePool.accounts.map((acc) => (
+                        <tr key={acc.email}>
+                          <td className="reserve-pool-check-col">
+                            <input
+                              type="checkbox"
+                              checked={selectedReserveEmails.has(acc.email)}
+                              onChange={() => toggleReserveSelection(acc.email)}
+                              aria-label={`选中 ${acc.email}`}
+                            />
+                          </td>
+                          <td className="reserve-pool-email">
+                            {acc.email}
+                            {(() => {
+                              const tag = acc.status === "checking"
+                                ? <span className="reserve-status-tag checking"><LoaderCircle className="spin" size={12} />获取中</span>
+                                : acc.status === "joining"
+                                  ? <span className="reserve-status-tag joining"><LoaderCircle className="spin" size={12} />加入中</span>
+                                  : acc.status === "skipped_banned" || acc.banned
+                                    ? <span className="reserve-status-tag banned">已封禁</span>
+                                    : acc.status === "fetch_failed"
+                                      ? <span className="reserve-status-tag failed" title={acc.fetchError || ""}>获取失败</span>
+                                      : <span className="reserve-status-tag normal">正常</span>;
+                              return <span className="reserve-status-inline">{tag}</span>;
+                            })()}
+                          </td>
+                          <td className="reserve-pool-center-col">
+                            {acc.hasBalance
+                              ? <span className="reserve-balance-tag has-balance">${acc.balance.toFixed(2)}</span>
+                              : <span className="reserve-balance-tag no-balance">无余额</span>}
+                          </td>
+                          <td className="reserve-pool-actions-col">
+                            {acc.status === "joining"
+                              ? <button type="button" className="secondary-button reserve-action-btn" disabled>加入中...</button>
+                              : (
+                                  <>
+                                    <button
+                                      type="button"
+                                      className="secondary-button reserve-action-btn"
+                                      onClick={() => joinReservePool(acc.email)}
+                                      disabled={acc.banned || !sub2apiSettings.baseUrl || !sub2apiSettings.adminApiKey}
+                                      title={!sub2apiSettings.baseUrl ? "请先配置 Sub2API" : acc.banned ? "账号已封禁" : "加入号池"}
+                                    >
+                                      手动加入
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="icon-button reserve-delete-btn"
+                                      onClick={() => deleteReservePool(acc.email)}
+                                      title="删除"
+                                    >
+                                      <Trash2 size={14} />
+                                    </button>
+                                  </>
+                                )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -1166,6 +1489,24 @@ function App() {
                   </span>
                 </label>
               )}
+              {features.sub2apiMonitor && sub2apiSettingsDraft.monitorEnabled && (
+                <label className="settings-field wide-settings-field sub2api-reserve-threshold">
+                  <span>备用号池自动补号阈值</span>
+                  <div className="reserve-threshold-row">
+                    <span className="reserve-threshold-label">当号池正常账号少于</span>
+                    <input
+                      type="number"
+                      min="0"
+                      max="100000"
+                      value={sub2apiSettingsDraft.reserveThreshold}
+                      onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, reserveThreshold: event.target.value }))}
+                      placeholder="0"
+                    />
+                    <span className="reserve-threshold-label">个时，从备用号池自动补号（0 = 不补号）</span>
+                  </div>
+                  <small>正常账号 = status=active 且可调度。备用号池空了会停止补号，只继续 401 修复</small>
+                </label>
+              )}
               <label className="settings-field wide-settings-field">
                 <span>管理员 API Key</span>
                 <input
@@ -1329,6 +1670,42 @@ function App() {
               <button type="button" className="cancel-button" onClick={() => setSub2apiSettingsOpen(false)} disabled={sub2apiSettingsSaving}>取消</button>
               <button type="submit" className="primary-button" disabled={sub2apiSettingsSaving}>
                 {sub2apiSettingsSaving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}保存配置
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+      {reserveImportOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !reserveImporting) setReserveImportOpen(false);
+        }}>
+          <form className="batch-dialog reserve-import-dialog" onSubmit={(event) => { event.preventDefault(); importReservePool(); }}>
+            <div className="batch-dialog-header">
+              <h2>导入备用号池</h2>
+              <button type="button" className="icon-button" onClick={() => setReserveImportOpen(false)} disabled={reserveImporting} aria-label="关闭">
+                <X size={18} />
+              </button>
+            </div>
+            <p className="batch-dialog-hint">
+              每行一个账号，格式：<code>邮箱----密码----clientId----refreshToken</code>
+              <br />
+              导入后会自动拉取邮件列表获取余额和封禁状态。不会立即登录授权。
+            </p>
+            <textarea
+              className="batch-textarea"
+              value={reserveImportText}
+              onChange={(event) => setReserveImportText(event.target.value)}
+              placeholder={"邮箱----密码----clientId----refreshToken\n邮箱----密码----clientId----refreshToken"}
+              rows={10}
+              spellCheck={false}
+              disabled={reserveImporting}
+            />
+            {reserveImportError && <div className="batch-dialog-error">{reserveImportError}</div>}
+            <div className="batch-dialog-actions">
+              <button type="button" className="secondary-button" onClick={() => setReserveImportOpen(false)} disabled={reserveImporting}>取消</button>
+              <button type="submit" className="primary-button" disabled={reserveImporting}>
+                {reserveImporting ? <LoaderCircle className="spin" size={16} /> : <Upload size={16} />}
+                导入
               </button>
             </div>
           </form>
@@ -2109,6 +2486,7 @@ function normalizeSub2ApiSettings(value) {
     autoSelectProxy: stored.autoSelectProxy !== false,
     disableAutoPause5h: stored.disableAutoPause5h === true,
     disableAutoPause7d: stored.disableAutoPause7d === true,
+    reserveThreshold: String(stored.reserveThreshold ?? ""),
   };
 }
 

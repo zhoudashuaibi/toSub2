@@ -1,0 +1,41 @@
+# 版本控制与元数据
+.git
+.gitignore
+.github
+.zcode/
+.DS_Store
+
+# 依赖目录（镜像内重新安装，避免本机差异）
+node_modules/
+**/__pycache__/
+*.py[cod]
+
+# 运行时数据与产物（容器内生成，不进镜像）
+tmp/
+.env
+.env.*
+!.env.example
+*.log
+chatgpt-protocol-session.json
+sub2api-import*.json
+login-checkpoint.json
+job-meta.json
+
+# 构建产物
+web/dist/
+
+# 文档与测试（不影响运行）
+docs/
+README.md
+*.md
+test/
+
+# 容器编排文件本身（无需进镜像）
+Dockerfile
+.dockerignore
+docker-compose*.yml
+ecosystem.config.cjs
+
+# 编辑器/IDE
+.vscode/
+.idea/

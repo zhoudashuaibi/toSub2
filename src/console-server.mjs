@@ -15,12 +15,26 @@ import { fetchMailboxOtpCandidates, validateMailApiUrl } from "./mail-otp.mjs";
 import {
   DEFAULT_OUTLOOK_ENDPOINT,
   fetchOutlookOtpCandidates,
+  fetchReserveAccountMessages,
+  extractBalanceFromMessages,
+  isAccountBannedFromMessages,
   normalizeOutlookEndpoint,
   parseOutlookEntries,
   validateOutlookEndpoint,
 } from "./outlook-mail.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
 import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
+
+// 加载项目根目录的 .env（如果存在）。已有同名系统环境变量不会被覆盖。
+// 这样可以在 .env 里配置 TOSUB2_CONSOLE_PASSWORD 等参数，免去每次启动手动传环境变量。
+// 文件不存在时静默跳过；Node 20.12+ 内置，无需额外依赖。
+try {
+  process.loadEnvFile(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".env"));
+} catch (error) {
+  if (error?.code !== "ENOENT" && error?.code !== "MODULE_NOT_FOUND") {
+    console.warn(`[warn] 读取 .env 失败，已跳过：${error.message}`);
+  }
+}
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
@@ -37,6 +51,8 @@ const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
 const OUTLOOK_FETCH_CONFIG_FILENAME = "outlook-fetch.json";
+const RESERVE_POOL_FILENAME = "reserve-pool.json";
+const RESERVE_MAIL_MAX_MESSAGES = 10;
 const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
@@ -53,8 +69,39 @@ const OUTPUT_ROOT = path.resolve(
 );
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
 const OUTLOOK_FETCH_CONFIG_PATH = path.join(OUTPUT_ROOT, OUTLOOK_FETCH_CONFIG_FILENAME);
+const RESERVE_POOL_PATH = path.join(OUTPUT_ROOT, RESERVE_POOL_FILENAME);
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
+
+// 控制台访问密码防护：启动时读取 TOSUB2_CONSOLE_PASSWORD，用 scrypt 哈希后只保存哈希，
+// 不明文存储；验证时用固定时间比较，避免时序侧信道。未设置环境变量时关闭防护，
+// 行为完全等同改造前（本机/可信局域网直接访问）。
+const CONSOLE_PASSWORD_SCRYPT_KEYLEN = 64;
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_LOCK_DURATION_MS = 15 * 60_000;
+const consolePasswordHash = computeConsolePasswordHash(process.env.TOSUB2_CONSOLE_PASSWORD);
+const consolePasswordEnabled = Boolean(consolePasswordHash);
+const loginAttempts = new Map(); // key: 客户端 IP -> { count, lockedUntil }
+
+const CONSOLE_FEATURES = {
+  retry: true,
+  regenerate: true,
+  phoneContext: true,
+  batchDownload: true,
+  bulkActions: true,
+  pagination: true,
+  uniqueEmail: true,
+  smsProviders: publicSmsProviderDefinitions(),
+  queue: true,
+  sourceExport: true,
+  cancelAll: true,
+  sub2apiUpload: true,
+  sub2apiMonitor: true,
+  tlsFingerprint: true,
+  totpSetup: true,
+  forceRelogin: true,
+};
+
 const jobs = new Map();
 const customSmsPoolPositions = new Map();
 const emailJobLocks = new Map();
@@ -81,6 +128,10 @@ const sub2ApiMonitorState = {
   lastResult: null,
 };
 
+// 备用号池（reserve pool）内存状态；敏感凭证存 credential store，这里只存非敏感信息。
+let reservePoolAccounts = [];
+let reservePoolWritePromise = Promise.resolve();
+
 const hostArg = process.argv.find((item) => item.startsWith("--host="));
 const hostIndex = process.argv.indexOf("--host");
 const requestedHost = String(
@@ -106,6 +157,7 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
 await loadSub2ApiMonitorConfiguration();
+await loadReservePool();
 await syncCompletedOutputs(true);
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
@@ -158,12 +210,74 @@ function addUtf8Charset(value) {
   return value;
 }
 
+/**
+ * 启动时把明文密码转成 scrypt 哈希。密码本身不会被保留在任何变量里。
+ * 返回 { salt, hash }（均为 Buffer），或 null（未配置密码）。
+ */
+function computeConsolePasswordHash(rawPassword) {
+  const password = String(rawPassword || "").trim();
+  if (!password) return null;
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(password, salt, CONSOLE_PASSWORD_SCRYPT_KEYLEN);
+  return { salt, hash };
+}
+
+/**
+ * 固定时间比较输入密码的 scrypt 派生值与已存哈希，避免时序侧信道泄露信息。
+ */
+function verifyConsolePassword(input) {
+  if (!consolePasswordHash) return false;
+  const candidate = crypto.scryptSync(
+    String(input || ""),
+    consolePasswordHash.salt,
+    CONSOLE_PASSWORD_SCRYPT_KEYLEN,
+  );
+  return candidate.length === consolePasswordHash.hash.length
+    && crypto.timingSafeEqual(candidate, consolePasswordHash.hash);
+}
+
+/**
+ * 取客户端 IP，优先读反向代理透传的 x-forwarded-for 首段，回退到 socket 直连地址。
+ */
+function getClientIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  if (forwarded) return forwarded;
+  return String(req.socket?.remoteAddress || "").replace(/^::ffff:/, "");
+}
+
+/**
+ * 检查某 IP 的登录锁定状态，返回 { locked, retryAfterSeconds }。
+ */
+function getLoginAttemptState(ip) {
+  const entry = loginAttempts.get(ip);
+  if (!entry) return { locked: false, retryAfterSeconds: 0 };
+  if (entry.lockedUntil && entry.lockedUntil > Date.now()) {
+    return { locked: true, retryAfterSeconds: Math.ceil((entry.lockedUntil - Date.now()) / 1000) };
+  }
+  return { locked: false, retryAfterSeconds: 0 };
+}
+
+function recordLoginFailure(ip) {
+  const entry = loginAttempts.get(ip) || { count: 0, lockedUntil: 0 };
+  entry.count += 1;
+  if (entry.count >= LOGIN_MAX_ATTEMPTS) {
+    entry.lockedUntil = Date.now() + LOGIN_LOCK_DURATION_MS;
+  }
+  loginAttempts.set(ip, entry);
+}
+
+function clearLoginAttempts(ip) {
+  loginAttempts.delete(ip);
+}
+
 server.listen(requestedPort, requestedHost, () => {
   const urls = getConsoleUrls(requestedHost, requestedPort);
   console.log(`[ok] ChatGPT onboarding console: ${urls[0]}`);
   for (const url of urls.slice(1)) console.log(`[ok] LAN access: ${url}`);
   console.log(`[info] Output directory: ${OUTPUT_ROOT}`);
-  if (isWildcardHost(requestedHost)) {
+  if (consolePasswordEnabled) {
+    console.log("[note] 控制台访问密码已启用，打开页面需要先输入密码。");
+  } else if (isWildcardHost(requestedHost)) {
     console.log("[note] LAN access is enabled without authentication. Keep downloaded OAuth files private.");
   } else {
     console.log("[note] This server only listens on the configured host. Keep downloaded OAuth files private.");
@@ -188,27 +302,49 @@ function getConsoleUrls(host, port) {
 
 async function handleApi(req, res, requestUrl) {
   if (req.method === "GET" && requestUrl.pathname === "/api/bootstrap") {
-    sendJson(res, 200, {
-      token: consoleToken,
-      features: {
-        retry: true,
-        regenerate: true,
-        phoneContext: true,
-        batchDownload: true,
-        bulkActions: true,
-        pagination: true,
-        uniqueEmail: true,
-        smsProviders: publicSmsProviderDefinitions(),
-        queue: true,
-        sourceExport: true,
-        cancelAll: true,
-        sub2apiUpload: true,
-        sub2apiMonitor: true,
-        tlsFingerprint: true,
-        totpSetup: true,
-        forceRelogin: true,
-      },
-    });
+    // 启用密码防护时，bootstrap 只告诉前端“需要登录”，不下发 token 也不暴露功能列表。
+    // 未启用时行为不变，本机/可信局域网仍可直接拿到 token。
+    if (consolePasswordEnabled) {
+      sendJson(res, 200, { authRequired: true });
+    } else {
+      sendJson(res, 200, { token: consoleToken, features: CONSOLE_FEATURES });
+    }
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/login") {
+    const ip = getClientIp(req);
+    if (!consolePasswordEnabled) {
+      // 未启用密码防护时，/api/login 直接放行（兼容前端统一登录流程）。
+      clearLoginAttempts(ip);
+      sendJson(res, 200, { token: consoleToken, features: CONSOLE_FEATURES });
+      return;
+    }
+    const lockState = getLoginAttemptState(ip);
+    if (lockState.locked) {
+      const minutes = Math.max(1, Math.ceil(lockState.retryAfterSeconds / 60));
+      sendJson(res, 429, {
+        error: `尝试次数过多，请 ${minutes} 分钟后再试`,
+        retryAfterSeconds: lockState.retryAfterSeconds,
+      });
+      return;
+    }
+    const body = await readJson(req);
+    if (verifyConsolePassword(body.password)) {
+      clearLoginAttempts(ip);
+      sendJson(res, 200, { token: consoleToken, features: CONSOLE_FEATURES });
+    } else {
+      recordLoginFailure(ip);
+      const remaining = Math.max(0, LOGIN_MAX_ATTEMPTS - (loginAttempts.get(ip)?.count || 0));
+      const justLocked = remaining === 0;
+      sendJson(res, 401, {
+        error: justLocked
+          ? `密码错误次数过多，已锁定 ${Math.round(LOGIN_LOCK_DURATION_MS / 60_000)} 分钟`
+          : `密码错误，剩余 ${remaining} 次尝试机会`,
+        remaining,
+        locked: justLocked,
+      });
+    }
     return;
   }
 
@@ -467,160 +603,13 @@ async function handleApi(req, res, requestUrl) {
     const selected = resolveSelectedJobs(body.ids);
     const downloadable = selected.filter((job) => job.resultSaved);
     if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
-    const payload = await buildSub2ApiUploadPayload(downloadable);
-    const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
-
-    // 未手动指定代理且开启自动选择时，为每个账号独立选择当前绑定账号最少的代理。
-    // 复用一份代理绑定数快照，并在内存中累加本次批量分配，避免整批都选中同一代理。
-    let proxySelection = null;
-    if (!config.proxyId && config.autoSelectProxy) {
-      try {
-        const proxyPayload = await requestSub2Api(config, "/api/v1/admin/proxies/all");
-        const proxies = Array.isArray(proxyPayload) ? proxyPayload : Array.isArray(proxyPayload?.data) ? proxyPayload.data : [];
-        const activeProxyIds = new Set(
-          proxies
-            .filter((proxy) => proxy && Number.isInteger(Number(proxy.id)) && String(proxy.status || "active") === "active")
-            .map((proxy) => Number(proxy.id)),
-        );
-        if (activeProxyIds.size) {
-          const accounts0 = await listAllSub2ApiOpenAiAccounts(config);
-          const counts = new Map();
-          for (const account of accounts0) {
-            const pid = Number(account?.proxy_id);
-            if (Number.isSafeInteger(pid) && pid > 0) counts.set(pid, (counts.get(pid) || 0) + 1);
-          }
-          proxySelection = { activeProxyIds, counts };
-        }
-      } catch (error) {
-        // 自动选代理失败不应阻断上传，降级为不设置 proxy_id（由 Sub2API 用默认代理）
-        proxySelection = null;
-      }
-    }
-
-    const accounts = payload.accounts.map((account) => {
-      const { proxy_key: _proxyKey, ...accountData } = account;
-      const credentials = { ...(account.credentials || {}) };
-      if (config.modelWhitelist.length) {
-        credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
-      }
-      let proxyIdForAccount = config.proxyId || 0;
-      if (!proxyIdForAccount && proxySelection) {
-        // 在快照基础上选最少绑定（并列随机），并立刻在内存累加，保证同批下一个账号看到更新后的计数
-        let minBound = Infinity;
-        const candidates = [];
-        for (const pid of proxySelection.activeProxyIds) {
-          const bound = proxySelection.counts.get(pid) || 0;
-          if (bound < minBound) {
-            minBound = bound;
-            candidates.length = 0;
-            candidates.push(pid);
-          } else if (bound === minBound) {
-            candidates.push(pid);
-          }
-        }
-        if (candidates.length) {
-          proxyIdForAccount = candidates[Math.floor(Math.random() * candidates.length)];
-          proxySelection.counts.set(proxyIdForAccount, (proxySelection.counts.get(proxyIdForAccount) || 0) + 1);
-        }
-      }
-      // 注入「禁用自动暂停」配置到账号 extra（合并，不覆盖已有字段）
-      const extra = { ...(accountData.extra && typeof accountData.extra === "object" ? accountData.extra : {}) };
-      if (config.disableAutoPause5h) extra.auto_pause_5h_disabled = true;
-      else delete extra.auto_pause_5h_disabled;
-      if (config.disableAutoPause7d) extra.auto_pause_7d_disabled = true;
-      else delete extra.auto_pause_7d_disabled;
-      return {
-        ...accountData,
-        credentials,
-        extra,
-        status: "active",
-        schedulable: true,
-        group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
-        ...(proxyIdForAccount ? { proxy_id: proxyIdForAccount } : {}),
-        ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
-        ...(config.loadFactor !== null ? { load_factor: config.loadFactor } : {}),
-        ...(config.priority !== null ? { priority: config.priority } : {}),
-      };
-    });
-
-    // 上传前查重：按 platform=openai + email 匹配远程已有账户，避免重新授权后上传造成重复。
-    // 已存在的走 PUT 覆盖 credentials + clear-error + 设可调度（与号池监控自动修复路径同构），
-    // 不存在的才走 POST batch 新增。远程账户无 email 的无法匹配，归入新增组（行为与旧版一致）。
-    const existing = await listAllSub2ApiOpenAiAccounts(config);
-    const remoteByEmail = new Map();
-    for (const acc of existing) {
-      const email = sub2ApiAccountEmail(acc);
-      if (email) remoteByEmail.set(email, Number(acc.id));
-    }
-    const toCreate = [];
-    const toUpdate = [];
-    for (const account of accounts) {
-      const email = sub2ApiAccountEmail(account);
-      const accountId = email ? remoteByEmail.get(email) : null;
-      if (Number.isSafeInteger(accountId) && accountId > 0) toUpdate.push({ account, accountId });
-      else toCreate.push(account);
-    }
-
-    // 首次导入的账户：在名字上追加初始余额后缀（oauth---email---N，N 为整数美元）。
-    // 余额还没查过则实时查一次；查询失败或已带后缀则保持原名。只对首次导入生效，
-    // 后续重新授权走 PUT 覆盖（toUpdate），名字保持首次上传时的标记不再变动。
-    if (toCreate.length) {
-      const jobByEmail = new Map();
-      for (const job of downloadable) {
-        const email = String(job.email || "").trim().toLowerCase();
-        if (email && isEmail(email)) jobByEmail.set(email, job);
-      }
-      await Promise.all(toCreate.map(async (account) => {
-        const email = sub2ApiAccountEmail(account);
-        const job = email ? jobByEmail.get(email) : null;
-        if (job) await appendInitialBalanceSuffix(account, job);
-      }));
-    }
-
-    // 新增组：保持原有 batch 创建逻辑（含 Idempotency-Key），仅在非空时发送。
-    let createResult = null;
-    if (toCreate.length) {
-      createResult = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
-        method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey },
-        body: JSON.stringify({ accounts: toCreate }),
-      });
-    }
-
-    // 覆盖组：逐条 PUT credentials（本地新授权凭据完整，直接覆盖）+ clear-error + 设可调度。
-    // 单条失败用 try/catch 收集，不中断整批，失败项回传前端供用户查看。
-    const updatedAccountIds = [];
-    const updateFailed = [];
-    for (const { account, accountId } of toUpdate) {
-      try {
-        await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}`, {
-          method: "PUT",
-          body: JSON.stringify({ credentials: account.credentials || {} }),
-        });
-        await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
-          method: "POST",
-          body: "{}",
-        });
-        await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/schedulable`, {
-          method: "POST",
-          body: JSON.stringify({ schedulable: true }),
-        });
-        updatedAccountIds.push(accountId);
-      } catch (error) {
-        updateFailed.push({ accountId, error: String(error?.message || error).slice(0, 500) });
-      }
-    }
-
+    const result = await uploadJobsToSub2Api(config, downloadable);
     sendJson(res, 200, {
       selected: selected.length,
       uploaded: downloadable.length,
       skipped: selected.length - downloadable.length,
-      created: toCreate.length,
-      updated: updatedAccountIds.length,
-      updatedAccountIds,
-      updateFailed,
+      ...result,
       groupIds: config.groupIds,
-      result: createResult,
     });
     return;
   }
@@ -649,6 +638,193 @@ async function handleApi(req, res, requestUrl) {
     if (!sub2ApiMonitorConfig?.enabled) throw httpError(409, "请先启用 Sub2API 号池监控");
     const result = await runSub2ApiMonitor("manual");
     sendJson(res, 200, { ...publicSub2ApiMonitorState(), result });
+    return;
+  }
+
+  // ===================== 备用号池（reserve pool） =====================
+
+  if (req.method === "GET" && requestUrl.pathname === "/api/reserve-pool") {
+    sendJson(res, 200, {
+      accounts: reservePoolAccounts.map(publicReserveAccount),
+      available: reservePoolAccounts.filter((a) => a.status === "idle" && !a.banned).length,
+      total: reservePoolAccounts.length,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/reserve-pool/import") {
+    const body = await readJson(req);
+    let entries;
+    try {
+      entries = parseOutlookEntries(body.text);
+    } catch (error) {
+      throw httpError(400, error.message);
+    }
+    if (entries.length > MAX_BATCH_JOBS) throw httpError(400, `一次最多导入 ${MAX_BATCH_JOBS} 条账号`);
+
+    // 构建主任务列表中已有邮箱的集合（避免和已在号池/任务队列中的号重复）
+    const jobEmails = new Set();
+    for (const job of listUniqueJobs()) {
+      if (job.email) jobEmails.add(job.email.toLowerCase());
+    }
+
+    // 如果配置了 Sub2API，查远程号池中已有邮箱，避免导入已在号池中的号。
+    // 优先用监控配置（已持久化），其次用前端本次传入的 config。
+    const sub2ApiEmails = new Set();
+    let dedupConfig = null;
+    if (sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey) {
+      dedupConfig = sub2ApiMonitorConfig;
+    } else if (body.config?.baseUrl && body.config?.adminApiKey) {
+      try { dedupConfig = normalizeSub2ApiConfig(body.config); } catch {}
+    }
+    if (dedupConfig) {
+      try {
+        const remoteAccounts = await listAllSub2ApiOpenAiAccounts(dedupConfig);
+        for (const acc of remoteAccounts) {
+          const email = sub2ApiAccountEmail(acc);
+          if (email) sub2ApiEmails.add(email);
+        }
+      } catch {
+        // Sub2API 查询失败不阻断导入，降级为只查本地
+      }
+    }
+
+    let created = 0;
+    let skipped = 0;
+    let duplicated = 0;
+    for (const entry of entries) {
+      if (findReserveAccount(entry.email)) {
+        skipped += 1; // 备用号池内部已存在
+        continue;
+      }
+      if (jobEmails.has(entry.email) || sub2ApiEmails.has(entry.email)) {
+        duplicated += 1; // 已在主任务列表或 Sub2API 号池中
+        continue;
+      }
+      reservePoolAccounts.push(normalizeReserveAccount({
+        email: entry.email,
+        hasBalance: false,
+        banned: false,
+        status: "idle",
+        importedAt: new Date().toISOString(),
+      }));
+      await saveReserveCredentials(entry);
+      created += 1;
+    }
+    void persistReservePool();
+    // 异步拉取邮件获取余额/封禁状态
+    const outlookConfig = await loadOutlookFetchConfig();
+    for (const entry of entries) {
+      const acc = findReserveAccount(entry.email);
+      if (acc && acc.status === "idle") {
+        void refreshReserveAccountStatus(acc, outlookConfig.endpoint);
+      }
+    }
+    sendJson(res, 201, {
+      accounts: reservePoolAccounts.map(publicReserveAccount),
+      created,
+      skipped,
+      duplicated,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/reserve-pool/refresh") {
+    const body = await readJson(req);
+    const email = String(body.email || "").trim().toLowerCase();
+    const outlookConfig = await loadOutlookFetchConfig();
+    if (email) {
+      const acc = findReserveAccount(email);
+      if (!acc) throw httpError(404, "备用号池中未找到该账号");
+      await refreshReserveAccountStatus(acc, outlookConfig.endpoint);
+    } else {
+      // 全部刷新（串行避免并发拉太多邮件）
+      for (const acc of reservePoolAccounts) {
+        if (acc.status === "joined") continue;
+        await refreshReserveAccountStatus(acc, outlookConfig.endpoint);
+      }
+    }
+    sendJson(res, 200, {
+      accounts: reservePoolAccounts.map(publicReserveAccount),
+      available: reservePoolAccounts.filter((a) => a.status === "idle" && !a.banned).length,
+      total: reservePoolAccounts.length,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/reserve-pool/join") {
+    const body = await readJson(req);
+    const email = String(body.email || "").trim().toLowerCase();
+    const acc = findReserveAccount(email);
+    if (!acc) throw httpError(404, "备用号池中未找到该账号");
+    if (acc.status === "joined") throw httpError(409, "该账号已加入号池");
+    if (acc.status === "joining") throw httpError(409, "该账号正在加入号池");
+    if (acc.banned) throw httpError(409, "该账号已被标记为封禁，无法加入");
+    // 需要有 Sub2API 配置才能上传。优先用监控配置，其次用前端本次传入的 config。
+    let joinConfig = null;
+    if (sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey) {
+      joinConfig = { ...sub2ApiMonitorConfig, groupIds: [...sub2ApiMonitorConfig.groupIds] };
+    } else if (body.config?.baseUrl && body.config?.adminApiKey) {
+      try { joinConfig = normalizeSub2ApiConfig(body.config); } catch {}
+    }
+    if (!joinConfig) {
+      throw httpError(409, "请先在 Sub2API 配置中填写后端地址和管理员 Key");
+    }
+    // 异步执行加入流程
+    void joinReserveToPool(email, joinConfig, "manual");
+    sendJson(res, 202, { email, status: "joining" });
+    return;
+  }
+
+  if (req.method === "DELETE" && requestUrl.pathname === "/api/reserve-pool") {
+    const body = await readJson(req);
+    const email = String(body.email || "").trim().toLowerCase();
+    const idx = reservePoolAccounts.findIndex((acc) => acc.email === email);
+    if (idx < 0) throw httpError(404, "备用号池中未找到该账号");
+    if (reservePoolAccounts[idx].status === "joining") {
+      throw httpError(409, "该账号正在加入号池，无法删除");
+    }
+    reservePoolAccounts.splice(idx, 1);
+    await deleteReserveCredentials(email);
+    void persistReservePool();
+    sendJson(res, 200, {
+      accounts: reservePoolAccounts.map(publicReserveAccount),
+      available: reservePoolAccounts.filter((a) => a.status === "idle" && !a.banned).length,
+      total: reservePoolAccounts.length,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/reserve-pool/clear") {
+    const body = await readJson(req);
+    // 支持批量删除指定邮箱；如果没有传 emails 则不做任何操作（前端必须传选中列表）
+    const emailsToDelete = Array.isArray(body.emails)
+      ? [...new Set(body.emails.map((e) => String(e || "").trim().toLowerCase()).filter(Boolean))]
+      : [];
+    if (!emailsToDelete.length) throw httpError(400, "请选择要删除的账号");
+    // 正在加入号池的不能删
+    const toDelete = [];
+    const blockedJoining = [];
+    for (const email of emailsToDelete) {
+      const acc = findReserveAccount(email);
+      if (!acc) continue;
+      if (acc.status === "joining") {
+        blockedJoining.push(email);
+        continue;
+      }
+      toDelete.push(acc);
+    }
+    if (blockedJoining.length) throw httpError(409, `${blockedJoining.length} 个账号正在加入号池，无法删除`);
+    for (const acc of toDelete) {
+      await deleteReserveCredentials(acc.email);
+    }
+    reservePoolAccounts = reservePoolAccounts.filter((acc) => !toDelete.includes(acc));
+    void persistReservePool();
+    sendJson(res, 200, {
+      accounts: reservePoolAccounts.map(publicReserveAccount),
+      available: reservePoolAccounts.filter((a) => a.status === "idle" && !a.banned).length,
+      total: reservePoolAccounts.length,
+    });
     return;
   }
 
@@ -1068,6 +1244,12 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     await saveJobMetadata(job);
     void refreshJobCreditBalance(job).then(() => saveJobMetadata(job)).catch(() => {});
     await finishSub2ApiAutoRepairSuccess(job);
+    // 备用号池补号任务完成 → 自动上传到 Sub2API
+    if (job.reserveJoinConfig) {
+      void finishReserveJoinUpload(job).catch((error) => {
+        console.warn(`[warn] 备用号池上传失败：${String(error?.message || error).slice(0, 180)}`);
+      });
+    }
     scheduleQueuedJobs();
     return;
   }
@@ -2281,6 +2463,157 @@ async function buildSub2ApiUploadPayload(downloadable) {
   };
 }
 
+/**
+ * 将已完成的 job 上传到 Sub2API（从 HTTP 端点和备用号池补号路径共用）。
+ * @param {object} config normalizeSub2ApiConfig 返回值
+ * @param {Array} downloadable 已完成的 job 列表（有 resultSaved）
+ * @returns {Promise<{created:number,updated:number,updatedAccountIds:number[],updateFailed:Array,result:*}>}
+ */
+async function uploadJobsToSub2Api(config, downloadable) {
+  const payload = await buildSub2ApiUploadPayload(downloadable);
+  const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
+
+  // 未手动指定代理且开启自动选择时，为每个账号独立选择当前绑定账号最少的代理。
+  let proxySelection = null;
+  if (!config.proxyId && config.autoSelectProxy) {
+    try {
+      const proxyPayload = await requestSub2Api(config, "/api/v1/admin/proxies/all");
+      const proxies = Array.isArray(proxyPayload) ? proxyPayload : Array.isArray(proxyPayload?.data) ? proxyPayload.data : [];
+      const activeProxyIds = new Set(
+        proxies
+          .filter((proxy) => proxy && Number.isInteger(Number(proxy.id)) && String(proxy.status || "active") === "active")
+          .map((proxy) => Number(proxy.id)),
+      );
+      if (activeProxyIds.size) {
+        const accounts0 = await listAllSub2ApiOpenAiAccounts(config);
+        const counts = new Map();
+        for (const account of accounts0) {
+          const pid = Number(account?.proxy_id);
+          if (Number.isSafeInteger(pid) && pid > 0) counts.set(pid, (counts.get(pid) || 0) + 1);
+        }
+        proxySelection = { activeProxyIds, counts };
+      }
+    } catch {
+      proxySelection = null;
+    }
+  }
+
+  const accounts = payload.accounts.map((account) => {
+    const { proxy_key: _proxyKey, ...accountData } = account;
+    const credentials = { ...(account.credentials || {}) };
+    if (config.modelWhitelist.length) {
+      credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
+    }
+    let proxyIdForAccount = config.proxyId || 0;
+    if (!proxyIdForAccount && proxySelection) {
+      let minBound = Infinity;
+      const candidates = [];
+      for (const pid of proxySelection.activeProxyIds) {
+        const bound = proxySelection.counts.get(pid) || 0;
+        if (bound < minBound) {
+          minBound = bound;
+          candidates.length = 0;
+          candidates.push(pid);
+        } else if (bound === minBound) {
+          candidates.push(pid);
+        }
+      }
+      if (candidates.length) {
+        proxyIdForAccount = candidates[Math.floor(Math.random() * candidates.length)];
+        proxySelection.counts.set(proxyIdForAccount, (proxySelection.counts.get(proxyIdForAccount) || 0) + 1);
+      }
+    }
+    const extra = { ...(accountData.extra && typeof accountData.extra === "object" ? accountData.extra : {}) };
+    if (config.disableAutoPause5h) extra.auto_pause_5h_disabled = true;
+    else delete extra.auto_pause_5h_disabled;
+    if (config.disableAutoPause7d) extra.auto_pause_7d_disabled = true;
+    else delete extra.auto_pause_7d_disabled;
+    return {
+      ...accountData,
+      credentials,
+      extra,
+      status: "active",
+      schedulable: true,
+      group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
+      ...(proxyIdForAccount ? { proxy_id: proxyIdForAccount } : {}),
+      ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
+      ...(config.loadFactor !== null ? { load_factor: config.loadFactor } : {}),
+      ...(config.priority !== null ? { priority: config.priority } : {}),
+    };
+  });
+
+  // 上传前查重：按 email 匹配远程已有账户，避免重复。
+  const existing = await listAllSub2ApiOpenAiAccounts(config);
+  const remoteByEmail = new Map();
+  for (const acc of existing) {
+    const email = sub2ApiAccountEmail(acc);
+    if (email) remoteByEmail.set(email, Number(acc.id));
+  }
+  const toCreate = [];
+  const toUpdate = [];
+  for (const account of accounts) {
+    const email = sub2ApiAccountEmail(account);
+    const accountId = email ? remoteByEmail.get(email) : null;
+    if (Number.isSafeInteger(accountId) && accountId > 0) toUpdate.push({ account, accountId });
+    else toCreate.push(account);
+  }
+
+  // 首次导入的账户：追加初始余额后缀
+  if (toCreate.length) {
+    const jobByEmail = new Map();
+    for (const job of downloadable) {
+      const email = String(job.email || "").trim().toLowerCase();
+      if (email && isEmail(email)) jobByEmail.set(email, job);
+    }
+    await Promise.all(toCreate.map(async (account) => {
+      const email = sub2ApiAccountEmail(account);
+      const job = email ? jobByEmail.get(email) : null;
+      if (job) await appendInitialBalanceSuffix(account, job);
+    }));
+  }
+
+  // 新增组
+  let createResult = null;
+  if (toCreate.length) {
+    createResult = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ accounts: toCreate }),
+    });
+  }
+
+  // 覆盖组
+  const updatedAccountIds = [];
+  const updateFailed = [];
+  for (const { account, accountId } of toUpdate) {
+    try {
+      await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}`, {
+        method: "PUT",
+        body: JSON.stringify({ credentials: account.credentials || {} }),
+      });
+      await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
+        method: "POST",
+        body: "{}",
+      });
+      await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/schedulable`, {
+        method: "POST",
+        body: JSON.stringify({ schedulable: true }),
+      });
+      updatedAccountIds.push(accountId);
+    } catch (error) {
+      updateFailed.push({ accountId, error: String(error?.message || error).slice(0, 500) });
+    }
+  }
+
+  return {
+    created: toCreate.length,
+    updated: updatedAccountIds.length,
+    updatedAccountIds,
+    updateFailed,
+    result: createResult,
+  };
+}
+
 function normalizeSub2ApiConfig(value) {
   const config = value && typeof value === "object" ? value : {};
   const baseUrl = String(config.baseUrl || "").trim().replace(/\/+$/, "");
@@ -2319,7 +2652,11 @@ function normalizeSub2ApiConfig(value) {
   const autoSelectProxy = config.autoSelectProxy !== false;
   const disableAutoPause5h = config.disableAutoPause5h === true;
   const disableAutoPause7d = config.disableAutoPause7d === true;
-  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, autoSelectProxy, disableAutoPause5h, disableAutoPause7d };
+  const reserveThresholdRaw = Number(config.reserveThreshold);
+  const reserveThreshold = Number.isFinite(reserveThresholdRaw) && reserveThresholdRaw >= 0 && reserveThresholdRaw <= 100000
+    ? Math.floor(reserveThresholdRaw)
+    : 0;
+  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, autoSelectProxy, disableAutoPause5h, disableAutoPause7d, reserveThreshold };
 }
 
 function readDurationEnv(name, fallback, minimum) {
@@ -2442,6 +2779,7 @@ async function persistSub2ApiMonitorConfiguration() {
       loadFactor: sub2ApiMonitorConfig.loadFactor,
       priority: sub2ApiMonitorConfig.priority,
       modelWhitelist: sub2ApiMonitorConfig.modelWhitelist,
+      reserveThreshold: sub2ApiMonitorConfig.reserveThreshold || 0,
     },
     state: {
       lastCheckAt: sub2ApiMonitorState.lastCheckAt,
@@ -2468,6 +2806,7 @@ function publicSub2ApiMonitorState() {
     nextCheckAt: sub2ApiMonitorState.nextCheckAt,
     lastError: sub2ApiMonitorState.lastError,
     lastResult: sub2ApiMonitorState.lastResult,
+    reserveThreshold: sub2ApiMonitorConfig?.reserveThreshold || 0,
   };
 }
 
@@ -2566,6 +2905,45 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
           await saveJobMetadata(job);
           summary.started += accounts.length;
         });
+      }
+
+      // ===================== 备用号池补号逻辑 =====================
+      // 当号池中正常账号（status=active 且 schedulable）少于阈值时，从备用号池补充。
+      if (config.reserveThreshold > 0) {
+        try {
+          const allAccounts = await listAllSub2ApiOpenAiAccounts(config);
+          // 正常账号 = 本项目上传的（oauth--- 前缀）且 status=active 且 schedulable
+          const normalCount = allAccounts.filter((acc) =>
+            /^oauth---/.test(String(acc.name || ""))
+            && String(acc.status || "") === "active"
+            && acc.schedulable !== false,
+          ).length;
+          summary.normalAccounts = normalCount;
+          summary.reserveThreshold = config.reserveThreshold;
+          summary.reserveAvailable = reservePoolHasAvailable();
+          summary.reserveAdded = 0;
+
+          if (normalCount < config.reserveThreshold && reservePoolHasAvailable()) {
+            let toAdd = config.reserveThreshold - normalCount;
+            while (toAdd > 0) {
+              const candidate = pickNextReserveAccount();
+              if (!candidate) {
+                summary.reserveExhausted = true;
+                appendJobLogSafe(`[monitor] 备用号池已无可用账号，停止补号（正常账号 ${normalCount}/${config.reserveThreshold}）。`);
+                break;
+              }
+              // 异步触发加入流程（不等待完成，避免阻塞巡检）
+              void joinReserveToPool(candidate.email, config, "monitor");
+              summary.reserveAdded += 1;
+              toAdd -= 1;
+            }
+          } else if (normalCount < config.reserveThreshold && !reservePoolHasAvailable()) {
+            summary.reserveExhausted = true;
+            appendJobLogSafe(`[monitor] 正常账号 ${normalCount}/${config.reserveThreshold}，但备用号池已空，仅继续 401 修复。`);
+          }
+        } catch (error) {
+          summary.reserveError = String(error?.message || error).slice(0, 300);
+        }
       }
 
       sub2ApiMonitorState.lastCheckAt = new Date().toISOString();
@@ -4047,6 +4425,335 @@ async function saveOutlookFetchConfig(endpoint) {
   await fs.writeFile(tempPath, `${JSON.stringify({ endpoint: normalized }, null, 2)}\n`, { mode: 0o600 });
   await fs.rename(tempPath, OUTLOOK_FETCH_CONFIG_PATH);
   return { endpoint: normalized };
+}
+
+// ===========================================================================
+// 备用号池（reserve pool）数据层
+// ===========================================================================
+
+/** 备用号池中单个账号的非敏感视图（不含 outlookRefreshToken / outlookPassword）。 */
+function publicReserveAccount(acc) {
+  return {
+    email: acc.email,
+    balance: acc.hasBalance ? acc.balance : null,
+    hasBalance: Boolean(acc.hasBalance),
+    banned: Boolean(acc.banned),
+    bannedReason: acc.bannedReason || null,
+    status: acc.status || "idle",
+    jobId: acc.jobId || null,
+    importedAt: acc.importedAt || null,
+    lastCheckedAt: acc.lastCheckedAt || null,
+    fetchError: acc.fetchError || null,
+  };
+}
+
+async function loadReservePool() {
+  try {
+    const raw = await fs.readFile(RESERVE_POOL_PATH, "utf8");
+    const data = JSON.parse(raw);
+    reservePoolAccounts = Array.isArray(data.accounts)
+      ? data.accounts.filter((a) => a && typeof a.email === "string").map(normalizeReserveAccount)
+      : [];
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[warn] 备用号池配置无法读取：${String(error?.message || error).slice(0, 180)}`);
+    }
+    reservePoolAccounts = [];
+  }
+}
+
+function normalizeReserveAccount(acc) {
+  return {
+    email: acc.email,
+    balance: typeof acc.balance === "number" ? acc.balance : null,
+    hasBalance: acc.hasBalance === true,
+    banned: acc.banned === true,
+    bannedReason: acc.bannedReason || null,
+    status: ["idle", "checking", "joining", "joined", "skipped_banned", "fetch_failed"].includes(acc.status)
+      ? acc.status
+      : "idle",
+    jobId: acc.jobId || null,
+    importedAt: acc.importedAt || null,
+    lastCheckedAt: acc.lastCheckedAt || null,
+    fetchError: acc.fetchError || null,
+  };
+}
+
+function persistReservePool() {
+  reservePoolWritePromise = reservePoolWritePromise.then(async () => {
+    const payload = {
+      version: 1,
+      accounts: reservePoolAccounts.map((acc) => ({
+        email: acc.email,
+        balance: acc.balance,
+        hasBalance: acc.hasBalance,
+        banned: acc.banned,
+        bannedReason: acc.bannedReason,
+        status: acc.status,
+        jobId: acc.jobId,
+        importedAt: acc.importedAt,
+        lastCheckedAt: acc.lastCheckedAt,
+        fetchError: acc.fetchError,
+      })),
+      updatedAt: new Date().toISOString(),
+    };
+    await fs.mkdir(path.dirname(RESERVE_POOL_PATH), { recursive: true });
+    const tempPath = `${RESERVE_POOL_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+    await fs.rename(tempPath, RESERVE_POOL_PATH);
+  }).catch((error) => {
+    console.warn(`[warn] 备用号池配置写入失败：${String(error?.message || error).slice(0, 180)}`);
+  });
+  return reservePoolWritePromise;
+}
+
+function findReserveAccount(email) {
+  const normalized = String(email || "").trim().toLowerCase();
+  return reservePoolAccounts.find((acc) => acc.email === normalized) || null;
+}
+
+function updateReserveAccount(email, updater) {
+  const acc = findReserveAccount(email);
+  if (!acc) return null;
+  updater(acc);
+  void persistReservePool();
+  return acc;
+}
+
+/** 备用号池凭证在 credential store 中的 key（reserve- 前缀避免和 job 冲突）。 */
+function reserveCredentialKey(email) {
+  return `reserve-${String(email || "").trim().toLowerCase()}`;
+}
+
+async function saveReserveCredentials(entry) {
+  try {
+    await credentialStore.save(reserveCredentialKey(entry.email), {
+      password: "",
+      totpSecret: "",
+      proxyUrl: "",
+      outlookClientId: entry.outlookClientId || "",
+      outlookRefreshToken: entry.outlookRefreshToken || "",
+      outlookPassword: entry.outlookPassword || "",
+    });
+    return true;
+  } catch (error) {
+    if (error?.status === 501) return false;
+    throw error;
+  }
+}
+
+async function loadReserveCredentials(email) {
+  try {
+    const data = await credentialStore.load(reserveCredentialKey(email));
+    return {
+      outlookClientId: typeof data.outlookClientId === "string" ? data.outlookClientId : "",
+      outlookRefreshToken: typeof data.outlookRefreshToken === "string" ? data.outlookRefreshToken : "",
+      outlookPassword: typeof data.outlookPassword === "string" ? data.outlookPassword : "",
+    };
+  } catch {
+    return { outlookClientId: "", outlookRefreshToken: "", outlookPassword: "" };
+  }
+}
+
+async function deleteReserveCredentials(email) {
+  await credentialStore.delete(reserveCredentialKey(email));
+}
+
+/**
+ * 拉取某个备用号的邮件列表并更新其余额 / 封禁状态。
+ * @param {object} acc 备用号池中的账号对象（会被原地更新）
+ * @param {string} endpoint Outlook relay 地址
+ */
+async function refreshReserveAccountStatus(acc, endpoint) {
+  const credentials = await loadReserveCredentials(acc.email);
+  if (!credentials.outlookClientId || !credentials.outlookRefreshToken) {
+    acc.fetchError = "缺少 Outlook 凭证（clientId / refreshToken）";
+    acc.status = "fetch_failed";
+    void persistReservePool();
+    return;
+  }
+  acc.status = "checking";
+  acc.fetchError = null;
+  void persistReservePool();
+  try {
+    const messages = await fetchReserveAccountMessages({
+      endpoint,
+      email: acc.email,
+      clientId: credentials.outlookClientId,
+      refreshToken: credentials.outlookRefreshToken,
+      password: credentials.outlookPassword,
+    });
+    const balanceInfo = extractBalanceFromMessages(messages);
+    const banInfo = isAccountBannedFromMessages(messages);
+    acc.hasBalance = balanceInfo.hasBalance;
+    acc.balance = balanceInfo.hasBalance ? balanceInfo.balance : null;
+    acc.banned = banInfo.banned;
+    acc.bannedReason = banInfo.banned || acc.bannedReason;
+    acc.lastCheckedAt = new Date().toISOString();
+    acc.fetchError = null;
+    if (acc.status === "checking") {
+      acc.status = acc.banned ? "skipped_banned" : "idle";
+    }
+  } catch (error) {
+    acc.fetchError = String(error?.message || error).slice(0, 300);
+    if (acc.status === "checking") acc.status = "fetch_failed";
+  }
+  void persistReservePool();
+}
+
+/** 挑选下一个可用的备用号（未封禁、idle 状态、有余额优先）。 */
+function pickNextReserveAccount() {
+  const idle = reservePoolAccounts.filter((acc) => acc.status === "idle" && !acc.banned);
+  if (!idle.length) return null;
+  // 有余额的优先，其次按导入顺序
+  idle.sort((a, b) => {
+    if (a.hasBalance && !b.hasBalance) return -1;
+    if (!a.hasBalance && b.hasBalance) return 1;
+    return 0;
+  });
+  return idle[0];
+}
+
+/** 备用号池是否有可用账号（未封禁且未加入号池）。 */
+function reservePoolHasAvailable() {
+  return reservePoolAccounts.some((acc) => (acc.status === "idle") && !acc.banned);
+}
+
+/**
+ * 将备用号池中的一个号加入号池（登录授权 → 上传到 Sub2API）。
+ * 流程：① 先拉邮件验证是否封禁 → ② 创建 job 登录授权 → ③ 完成后自动上传
+ * @param {string} email
+ * @param {object} config Sub2API 配置（含 baseUrl/adminApiKey/groupIds 等）
+ * @param {string} trigger "manual" | "monitor"
+ */
+async function joinReserveToPool(email, config, trigger = "manual") {
+  const acc = findReserveAccount(email);
+  if (!acc) return;
+  if (acc.status === "joined" || acc.status === "joining") return;
+
+  // ① 先拉邮件验证是否封禁
+  acc.status = "joining";
+  acc.fetchError = null;
+  void persistReservePool();
+  try {
+    const outlookConfig = await loadOutlookFetchConfig();
+    const credentials = await loadReserveCredentials(email);
+    if (!credentials.outlookClientId || !credentials.outlookRefreshToken) {
+      throw new Error("缺少 Outlook 凭证");
+    }
+    const messages = await fetchReserveAccountMessages({
+      endpoint: outlookConfig.endpoint,
+      email,
+      clientId: credentials.outlookClientId,
+      refreshToken: credentials.outlookRefreshToken,
+      password: credentials.outlookPassword,
+    });
+    const banInfo = isAccountBannedFromMessages(messages);
+    if (banInfo.banned) {
+      acc.banned = true;
+      acc.bannedReason = banInfo.reason || "邮件命中封禁关键词";
+      acc.status = "skipped_banned";
+      void persistReservePool();
+      appendJobLogSafe(`[reserve] ${email} 邮件验证发现账号已封禁，已跳过。`);
+      return;
+    }
+    // 更新余额信息
+    const balanceInfo = extractBalanceFromMessages(messages);
+    acc.hasBalance = balanceInfo.hasBalance;
+    acc.balance = balanceInfo.hasBalance ? balanceInfo.balance : null;
+    acc.lastCheckedAt = new Date().toISOString();
+    void persistReservePool();
+
+    // ② 创建 job 登录授权（使用 outlook 邮箱 OTP 模式）
+    const existing = findJobByEmail(email);
+    if (existing && (isActive(existing.status) || existing.status === "queued")) {
+      acc.status = "idle";
+      acc.fetchError = "该邮箱已有正在进行的登录任务";
+      void persistReservePool();
+      return;
+    }
+
+    const jobCredentials = {
+      email,
+      loginMode: "email_otp",
+      mailApiUrl: null,
+      password: "",
+      totpSecret: "",
+      outlookClientId: credentials.outlookClientId,
+      outlookRefreshToken: credentials.outlookRefreshToken,
+      outlookPassword: credentials.outlookPassword,
+    };
+
+    // 如果已有 job（terminal 状态），强制重新登录；否则创建新 job
+    let job;
+    if (existing) {
+      await updateJobCredentials(existing, jobCredentials, { hasProxyUpdate: false });
+      job = existing;
+    } else {
+      job = await startJob(email, jobCredentials, null);
+    }
+
+    // 标记此 job 为备用号池补号任务，完成后自动上传
+    job.reserveJoinConfig = { ...config, groupIds: [...config.groupIds] };
+    job.reserveJoinEmail = email;
+    acc.jobId = job.id;
+    void persistReservePool();
+
+    // 如果是已有 job 且处于 terminal 状态，触发重新登录
+    if (existing && canForceRelogin(job)) {
+      await forceReloginJob(job, {}, {});
+    }
+
+    appendJobLogSafe(`[reserve] ${email} 已从备用号池开始加入号池（触发：${trigger}）。`);
+  } catch (error) {
+    acc.status = "idle";
+    acc.fetchError = String(error?.message || error).slice(0, 300);
+    void persistReservePool();
+    appendJobLogSafe(`[reserve] ${email} 加入号池失败：${acc.fetchError}`);
+  }
+}
+
+/** 安全地输出日志（避免在没有 console 的场景下报错）。 */
+function appendJobLogSafe(message) {
+  console.log(message);
+}
+
+/**
+ * 备用号池补号任务完成后的上传处理（在 handleChildClose 中调用）。
+ * 如果 job 有 reserveJoinConfig，则自动上传到 Sub2API。
+ */
+async function finishReserveJoinUpload(job) {
+  if (!job.reserveJoinConfig) return false;
+  const config = job.reserveJoinConfig;
+  const email = job.reserveJoinEmail;
+  try {
+    if (!job.resultSaved) throw new Error("授权文件未生成");
+    await uploadJobsToSub2Api(config, [job]);
+    appendJobLogSafe(`[reserve] ${email} 授权完成并已上传到 Sub2API 号池。`);
+    // 上传成功后从备用号池移除（与导入时去重逻辑保持一致）
+    if (email) {
+      const idx = reservePoolAccounts.findIndex((acc) => acc.email === email);
+      if (idx >= 0) {
+        reservePoolAccounts.splice(idx, 1);
+        void deleteReserveCredentials(email);
+        void persistReservePool();
+      }
+    }
+    return true;
+  } catch (error) {
+    const msg = String(error?.message || error).slice(0, 500);
+    appendJobLogSafe(`[reserve] ${email} 上传到 Sub2API 失败：${msg}`);
+    if (email) {
+      updateReserveAccount(email, (acc) => {
+        acc.status = "idle";
+        acc.fetchError = `上传失败：${msg}`;
+      });
+    }
+    return false;
+  } finally {
+    job.reserveJoinConfig = null;
+    job.reserveJoinEmail = null;
+  }
 }
 
 /**

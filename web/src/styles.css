@@ -905,3 +905,301 @@ tbody tr:last-child td { border-bottom: 0; }
 @media (max-width: 430px) {
   .bulk-actions { grid-template-columns: 1fr; }
 }
+
+/* ===================== 备用号池（reserve pool） ===================== */
+
+.reserve-pool-section {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+
+.reserve-pool-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  gap: 8px;
+}
+
+.reserve-pool-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--ink);
+  padding: 4px 0;
+}
+
+.reserve-pool-toggle:hover { color: var(--green); }
+
+.reserve-pool-summary {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: normal;
+  margin-left: 4px;
+}
+
+.reserve-pool-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.reserve-clear-btn {
+  color: var(--danger) !important;
+}
+
+.reserve-pool-table-wrapper {
+  border-top: 1px solid var(--line);
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: 430px; /* 约表头 + 10 行高度 */
+}
+
+.reserve-pool-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  table-layout: auto;
+}
+
+.reserve-pool-table th {
+  text-align: left;
+  padding: 6px 12px;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  z-index: 1;
+}
+
+.reserve-pool-table td {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+
+.reserve-pool-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.reserve-pool-table tbody tr:hover {
+  background: var(--green-soft);
+}
+
+.reserve-pool-check-col {
+  width: 1%;
+  white-space: nowrap;
+  text-align: center;
+}
+
+.reserve-pool-check-col input {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.reserve-pool-email {
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+  font-size: 12px;
+  white-space: nowrap;
+  /* 邮箱列占满剩余空间 */
+  width: auto;
+}
+
+/* 状态 tag 紧跟在邮箱后面（同一列内） */
+.reserve-status-inline {
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+/* 表头里的"状态"标签，跟邮箱标题保持和内容同样的间距 */
+.reserve-th-status {
+  margin-left: 8px;
+  font-weight: 400;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* 余额列居中，紧凑宽度 */
+.reserve-pool-center-col {
+  text-align: center;
+  white-space: nowrap;
+  width: 1%;
+}
+
+.reserve-pool-table th.reserve-pool-center-col {
+  text-align: center;
+}
+
+/* 操作列紧凑宽度，紧跟内容后面，不撑到最右边 */
+.reserve-pool-actions-col {
+  white-space: nowrap;
+  text-align: left;
+  width: 1%;
+}
+
+/* 余额 tag */
+.reserve-balance-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.reserve-balance-tag.has-balance {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.reserve-balance-tag.no-balance {
+  color: var(--muted);
+  background: #f0f1f0;
+}
+
+/* 状态 tag */
+.reserve-status-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.reserve-status-tag.normal {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.reserve-status-tag.banned {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.reserve-status-tag.checking,
+.reserve-status-tag.joining {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.reserve-status-tag.joined {
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.reserve-status-tag.failed {
+  color: var(--muted);
+  background: #f0f1f0;
+}
+
+.reserve-action-btn {
+  padding: 3px 10px !important;
+  font-size: 12px !important;
+}
+
+.reserve-delete-btn {
+  margin-left: 4px;
+  opacity: 0.6;
+}
+
+.reserve-delete-btn:hover { opacity: 1; }
+
+.reserve-pool-empty {
+  padding: 20px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* 补号阈值输入 */
+.sub2api-reserve-threshold .reserve-threshold-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sub2api-reserve-threshold .reserve-threshold-row input {
+  width: 60px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 14px;
+}
+
+.sub2api-reserve-threshold .reserve-threshold-label {
+  font-size: 13px;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+/* 导入弹窗 */
+.reserve-import-dialog .batch-dialog-hint {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.6;
+  margin: 8px 0;
+}
+
+.reserve-import-dialog .batch-dialog-hint code {
+  background: var(--green-soft);
+  color: var(--green);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+/* 访问密码登录框 */
+.login-gate-backdrop { z-index: 30; }
+.login-gate-dialog { width: min(380px, 100%); }
+.login-gate-dialog .dialog-header { border-bottom: 0; padding-bottom: 4px; }
+.login-gate-dialog .dialog-header > div {
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+.login-gate-brand {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: var(--green);
+  border-radius: 9px;
+}
+.login-gate-dialog .dialog-header h2 { text-align: center; }
+.login-gate-hint { margin: 6px 0 4px; text-align: center; color: var(--muted); font-size: 13px; }
+.login-gate-field { margin-top: 14px; }
+.login-gate-field > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+.login-gate-field input {
+  flex: 1;
+  height: 38px;
+  padding: 0 12px;
+  outline: 0;
+  background: #fbfcfb;
+  border: 1px solid #cdd5d1;
+  border-radius: 6px;
+}
+.login-gate-field input:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+.login-gate-submit { width: 100%; height: 40px; justify-content: center; }
+.login-gate-dialog .dialog-footer { margin-top: 16px; }

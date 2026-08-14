@@ -1,0 +1,30 @@
+services:
+  tosub2:
+    build: .
+    image: tosub2:latest
+    container_name: tosub2
+    restart: unless-stopped
+    ports:
+      # 左边：宿主机端口（改成你想要的）；右边：容器内端口，固定
+      - "4399:4399"
+    volumes:
+      # 任务产物、号池配置等持久化数据（容器删了数据还在）
+      - ./data:/app/data
+      # ── 可选：用 .env 文件集中管理环境变量 ──
+      # 取消下面一行注释，并在项目根目录先创建 .env 文件（写 TOSUB2_CONSOLE_PASSWORD=你的密码），
+      # 即可用文件管理所有配置；改完 .env 后 docker compose restart 即可生效。
+      # 注意：若取消注释，必须先创建 .env 文件，否则容器启动会失败。
+      # - ./.env:/app/.env:ro
+    environment:
+      # ⚠️ 公网部署必填！改成你自己的强密码。留空则任何人打开页面都能操作。
+      # 这里直接从项目根目录的 .env 自动读取（docker compose 原生支持），无需额外配置。
+      TOSUB2_CONSOLE_PASSWORD: ${TOSUB2_CONSOLE_PASSWORD:-}
+    # 内存上限保护：避免 Node 异常时吃光宿主机内存（按服务器配置调整）
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4399/api/bootstrap"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

@@ -110,6 +110,89 @@ npm run daemon:stop
 
 PM2 只负责在进程异常退出后重启。toSub2 在正常关闭时仍会先取消巡检请求、停止登录任务并保存任务状态。
 
+### 公网部署与访问密码
+
+部署到公网（或不可信网络）时，必须先设置访问密码，否则任何打开页面的人都能拿到控制台令牌、查看和操作全部账号数据。设置环境变量 `TOSUB2_CONSOLE_PASSWORD` 即可启用访问密码防护。
+
+推荐用项目根目录的 `.env` 文件配置（启动时自动加载，免去每次手动传环境变量）：
+
+```bash
+# 在项目根目录创建 .env，写入（等号两边不要加引号）
+TOSUB2_CONSOLE_PASSWORD=你的密码
+ONBOARDING_HOST=0.0.0.0
+```
+
+也可以直接用命令行临时指定：
+
+```bash
+# macOS / Linux
+TOSUB2_CONSOLE_PASSWORD=你的密码 ONBOARDING_HOST=0.0.0.0 npm run dev
+
+# Windows PowerShell
+$env:TOSUB2_CONSOLE_PASSWORD="你的密码"
+$env:ONBOARDING_HOST="0.0.0.0"
+npm run dev
+```
+
+> `.env` 已被 `.gitignore` 忽略，不会提交到仓库；已有同名系统环境变量不会被 `.env` 覆盖。
+
+启用后，打开页面会先显示「访问验证」登录框，输入正确密码才能进入控制台；密码以 scrypt 哈希校验、不明文存储，同一 IP 连续输错 5 次会被锁定 15 分钟。不设置该环境变量时行为完全不变（本机或可信局域网直接访问，无需登录）。
+
+> 安全提醒：访问密码在传输过程中仍为明文，**务必配合 HTTPS（反向代理或 TLS 终端）使用**，否则密码可能被中间人截获。建议用 Nginx / Caddy 等反向代理在前面加一层 HTTPS。
+
+### Docker 容器部署（推荐用于服务器）
+
+项目自带 `Dockerfile`、`docker-compose.yml` 和 `.dockerignore`，镜像基于 Node 22 + Python 3（Debian slim），内置 `curl_cffi` 和正确的 PID 1 信号处理（`tini`），适合长时间在服务器上运行。
+
+**最快上手**（在项目根目录）：
+
+```bash
+# 1. 配置访问密码（公网部署必填，本机自用可跳过）
+echo 'TOSUB2_CONSOLE_PASSWORD=你的强密码' > .env
+
+# 2. 构建并后台启动
+docker compose up -d --build
+
+# 3. 查看日志 / 状态
+docker compose logs -f
+docker compose ps
+```
+
+默认通过宿主机的 `4399` 端口访问：`http://服务器IP:4399`。启动后打开页面会先要求输入访问密码。
+
+**配置说明**（`docker-compose.yml`）：
+
+| 配置项 | 说明 |
+|--------|------|
+| `ports: "4399:4399"` | 左边宿主机端口可改，右边容器内固定。改端口只改左边 |
+| `./data:/app/data` | 数据持久化卷：任务产物、号池配置都在这里。容器删了重建数据还在 |
+| `TOSUB2_CONSOLE_PASSWORD` | 访问密码，从 `.env` 自动读取。留空 = 无密码（仅本机自用场景）|
+| `mem_limit: 1g` | 容器内存上限，防止异常吃满宿主机内存。1G 够用，服务器紧张可调到 512m |
+| `restart: unless-stopped` | 崩溃自动重启，但手动 `docker compose stop` 不会重启 |
+
+**端口修改**：要改宿主机端口（比如用 8080），编辑 `docker-compose.yml` 的 `- "8080:4399"`，然后 `docker compose up -d`。
+
+**更新版本**：
+
+```bash
+git pull
+docker compose up -d --build   # 重新构建并替换旧容器，数据卷不变
+```
+
+**数据备份**：只需备份项目根目录的 `data/` 文件夹，里面包含所有任务产物和号池配置。
+
+**常用命令**：
+
+```bash
+docker compose up -d --build   # 构建并启动
+docker compose down            # 停止并删除容器（数据保留）
+docker compose stop            # 仅停止（容器仍在，下次 start 即可）
+docker compose restart         # 重启（改了 .env 后用这个生效）
+docker compose logs -f         # 实时日志
+```
+
+> Linux 容器说明：toSub2 的账号密码、2FA 密钥、Outlook 凭据持久化依赖 macOS Keychain 或 Windows DPAPI，**Linux/容器内无法持久保存这些凭据**（重启容器后丢失，但任务进度靠 `job-meta.json` 仍可恢复）。这是上游设计限制，Docker 部署同样适用。
+
 ## 账号代理和 TLS 指纹
 
 网页顶部的“代理 IP”输入框配置账号登录使用的代理。支持以下格式：
@@ -267,8 +350,20 @@ node src/protocol-login.mjs --help
 - Windows 保存的密码和 2FA 密钥由 DPAPI（数据保护接口）按当前用户加密，不会以明文写入任务目录。
 - sub2api 导入文件包含可用的授权令牌，应当按密码文件保护。
 - 不要把 API Key、密码、2FA 密钥、验证码、Cookie 或 Token 提交到 Git 仓库。
-- 网页控制台用于本机或可信局域网，不提供公网部署所需的身份认证。
+- 网页控制台用于本机或可信局域网时无需登录；公网部署请务必设置 `TOSUB2_CONSOLE_PASSWORD` 访问密码，并配合 HTTPS 使用（详见上文「公网部署与访问密码」）。
 - 只处理你本人持有或已获得明确授权的账号。
+
+### 长期运行的内存与性能
+
+toSub2 设计为长时间运行（号池巡检依赖控制台持续在线），以下是关于内存和性能的说明：
+
+- **任务记录会累积**：已完成的任务会保留在内存中（每条最多约 80KB 日志），便于随时查看和重新授权。任务积累到上千条时内存占用会明显上升（约几百 MB）。**定期在页面上删除不再需要的任务**是控制内存最直接的办法。
+- **重启清空日志缓存**：任务日志不落盘，重启服务（或重启容器）会清空所有内存中的日志，任务本身仍能从磁盘恢复。任务量大时，重启一次即可释放日志占用的内存。
+- **Docker 内存上限**：`docker-compose.yml` 默认设置 `mem_limit: 1g`，异常情况下不会吃满宿主机内存；正常运行约占用 200MB 左右。
+- **前端轮询**：页面打开时会每 0.9 秒刷新一次任务列表，任务非常多时可能感到轻微卡顿，关闭页面或切到后台标签页即可停止轮询。
+- **凭据持久化**：Linux/容器内无法持久保存账号密码、2FA 密钥和 Outlook 凭据（依赖 macOS/Windows 系统级加密），重启后需重新录入；任务进度和授权文件不受影响。
+
+总体而言，正常使用（几十到几百条任务）内存稳定可控；如果任务量很大，定期清理或定期重启容器即可保持流畅。
 
 ## 免责声明
 
